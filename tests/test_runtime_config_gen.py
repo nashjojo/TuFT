@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
+from tuft.config import ModelConfig
 from tuft.runtime._config_gen import (
     _infer_max_model_len,
     _read_max_position_embeddings,
@@ -97,3 +100,14 @@ class TestGenerateConfigFile:
 
         content = config_path.read_text()
         assert "test-model" in content
+
+
+def test_model_config_rejects_data_parallel_with_tensor_parallel(tmp_path):
+    with pytest.raises(ValueError, match="Data parallel sampling requires tensor_parallel_size=1."):
+        ModelConfig(
+            model_name="bad-config",
+            model_path=tmp_path,
+            max_model_len=2048,
+            tensor_parallel_size=2,
+            data_parallel_size=4,
+        )

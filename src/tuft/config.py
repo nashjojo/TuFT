@@ -80,6 +80,8 @@ class ModelConfig(BaseModel):
             raise ValueError("Colocate option is only supported for tensor_parallel_size=1.")
         if self.colocate and self.data_parallel_size != 1:
             raise ValueError("Colocate option is only supported for data_parallel_size=1.")
+        if self.data_parallel_size > 1 and self.tensor_parallel_size != 1:
+            raise ValueError("Data parallel sampling requires tensor_parallel_size=1.")
         return self
 
     @model_validator(mode="after")
