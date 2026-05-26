@@ -185,6 +185,8 @@ class VLLMSamplingBackend(BaseSamplingBackend):
         super().__init__(config)
         self._worker_venv_path = worker_venv_path
         self.engine = self._create_engine(config)
+        self.engines = self.engine if isinstance(self.engine, list) else [self.engine]
+        self._engine_idx = 0
         self.lora_adapters: dict[str, LoRARequest] = {}
         self._counter = 1
         self._lock = asyncio.Lock()
@@ -253,12 +255,10 @@ class VLLMSamplingBackend(BaseSamplingBackend):
         from trinity.common.config import InferenceModelConfig
         from trinity.common.models.vllm_model import vLLMRolloutModel
 
-        # Assign tensor_parallel_size GPUs to the actor itself
-        # so that Ray populates CUDA_VISIBLE_DEVICES correctly.  vLLM then
-        # creates its own placement group inside the EngineCore process where
-        # the GPUs are visible.
-        num_gpus = config.tensor_parallel_size
-        bundle_indices = ",".join(str(i) for i in range(config.tensor_parallel_size))
+        # TP mode: one actor with tensor_parallel_size GPUs.
+        # DP mode: multiple actors, each with TP=1 on one GPU.
+        use_data_parallel = config.data_parallel_size > 1 and config.tensor_parallel_size == 1
+        num_replicas = config.data_parallel_size if use_data_parallel else 1
 
         if not self._worker_venv_path or not self._worker_venv_path.strip():
             _runtime_env = {}
@@ -272,46 +272,52 @@ class VLLMSamplingBackend(BaseSamplingBackend):
                     "PATH": f"{self._worker_venv_path}/bin:{_path}",
                 },
             }
-        return (
-            ray.remote(vLLMRolloutModel)
-            .options(
-                name="sampling_model_" + self.base_model,
-                num_gpus=num_gpus,
-                runtime_env=_runtime_env,
-            )
-            .remote(
-                config=InferenceModelConfig(
-                    model_path=str(config.model_path),
-                    tensor_parallel_size=config.tensor_parallel_size,
-                    max_model_len=(
-                        config.sampling_max_model_len
-                        if config.sampling_max_model_len is not None
-                        else config.max_model_len
-                    ),
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    logprobs=config.logprobs,
-                    min_response_tokens=config.min_response_tokens,
-                    repetition_penalty=1.0,
-                    enable_lora=True,
-                    enable_runtime_lora_updating=True,
-                    enable_openai_api=True,
-                    lora_kwargs={
-                        "max_lora_rank": config.max_lora_rank,
-                        "max_loras": config.max_loras,
-                    },
-                    gpu_memory_utilization=config.sampling_memory_fraction,
-                    bundle_indices=bundle_indices,
+        engines = []
+        for i in range(num_replicas):
+            tp = 1 if use_data_parallel else config.tensor_parallel_size
+            num_gpus = 1 if use_data_parallel else config.tensor_parallel_size
+            bundle_indices = ",".join(str(j) for j in range(tp))
+            engines.append(
+                ray.remote(vLLMRolloutModel)
+                .options(
+                    name=f"sampling_model_{self.base_model}_{i}",
+                    num_gpus=num_gpus,
+                    runtime_env=_runtime_env,
+                )
+                .remote(
+                    config=InferenceModelConfig(
+                        model_path=str(config.model_path),
+                        tensor_parallel_size=tp,
+                        max_model_len=(
+                            config.sampling_max_model_len
+                            if config.sampling_max_model_len is not None
+                            else config.max_model_len
+                        ),
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        logprobs=config.logprobs,
+                        min_response_tokens=config.min_response_tokens,
+                        repetition_penalty=1.0,
+                        enable_lora=True,
+                        enable_runtime_lora_updating=True,
+                        enable_openai_api=True,
+                        lora_kwargs={
+                            "max_lora_rank": config.max_lora_rank,
+                            "max_loras": config.max_loras,
+                        },
+                        gpu_memory_utilization=config.sampling_memory_fraction,
+                        bundle_indices=bundle_indices,
+                    )
                 )
             )
-        )
+        return engines if use_data_parallel else engines[0]
 
     async def async_init(self) -> None:
         """Initialize the backend for sampling."""
         # Ray @ray.remote decorator adds .remote() method dynamically
-        await self.engine.prepare.remote()  # type: ignore[attr-defined]
-        self._openai_api_url = await self.engine.get_api_server_url.remote()  # type: ignore[attr-defined]
+        await asyncio.gather(*[engine.prepare.remote() for engine in self.engines])  # type: ignore[attr-defined]
+        self._openai_api_url = await self.engines[0].get_api_server_url.remote()  # type: ignore[attr-defined]
         logger.info(
             f"SamplingBackend for model {self.base_model} initialized. "
             f"OpenAI API URL: {self._openai_api_url}"
@@ -415,7 +421,9 @@ class VLLMSamplingBackend(BaseSamplingBackend):
                     params["stop"] = sampling_params.stop
 
                 # Ray @ray.remote decorator adds .remote() method dynamically
-                req_output = await self.engine._generate_internal.remote(  # type: ignore[attr-defined]
+                engine = self.engines[self._engine_idx]
+                self._engine_idx = (self._engine_idx + 1) % len(self.engines)
+                req_output = await engine._generate_internal.remote(  # type: ignore[attr-defined]
                     prompt={"prompt_token_ids": prompt_token_ids},
                     lora_request=lora_request,
                     **params,
@@ -445,7 +453,12 @@ class VLLMSamplingBackend(BaseSamplingBackend):
                     )
                     if not adapter_path.exists():
                         raise ValueError(f"LoRA adapter path {adapter_path} does not exist.")
-                    await self.engine.add_lora_adapter.remote(self.lora_adapters[lora_id])  # type: ignore[attr-defined]
+                    await asyncio.gather(
+                        *[
+                            engine.add_lora_adapter.remote(self.lora_adapters[lora_id])  # type: ignore[attr-defined]
+                            for engine in self.engines
+                        ]
+                    )
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(StatusCode.ERROR)
@@ -456,7 +469,12 @@ class VLLMSamplingBackend(BaseSamplingBackend):
             span.set_attribute("tuft.lora_id", lora_id)
             async with self._lock:
                 if lora_id in self.lora_adapters:
-                    await self.engine.remove_lora_adapter.remote(lora_id)  # type: ignore[attr-defined]
+                    await asyncio.gather(
+                        *[
+                            engine.remove_lora_adapter.remote(lora_id)  # type: ignore[attr-defined]
+                            for engine in self.engines
+                        ]
+                    )
                     del self.lora_adapters[lora_id]
 
 

@@ -30,6 +30,7 @@ model_owner: local-user
 #
 # Optional model settings:
 #   - tensor_parallel_size: Number of GPUs for tensor parallelism (default: 1)
+#   - data_parallel_size: Number of sampling replicas (TP=1 required, default: 1)
 #   - temperature: Default sampling temperature (default: 1.0)
 #   - top_p: Default nucleus sampling probability (default: 1.0)
 #   - top_k: Default top-k sampling (default: -1, disabled)
