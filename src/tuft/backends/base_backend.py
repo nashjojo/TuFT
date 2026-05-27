@@ -56,7 +56,12 @@ class BaseSamplingBackend(BaseBackend):
 
         TUFT_CPU_TEST=1: use DummySamplingBackend (no vLLM, for CPU-only unit tests).
         Otherwise: VLLMSamplingBackend (creates Ray/vLLM actor in __init__, may block startup).
+        When data_parallel_size > 1, wraps replicas in DataParallelSamplingBackend.
         """
+        if config.data_parallel_size > 1:
+            from ..backends.dp_sampling_backend import DataParallelSamplingBackend
+
+            return DataParallelSamplingBackend(config, worker_venv_path=worker_venv_path)
         if os.getenv("TUFT_CPU_TEST", "0") == "1":
             from ..backends.sampling_backend import DummySamplingBackend
 

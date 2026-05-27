@@ -179,11 +179,17 @@ class VLLMSamplingBackend(BaseSamplingBackend):
     `compute_logprobs_async` are all supported by the sample method.
     """
 
-    def __init__(self, config: ModelConfig, worker_venv_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        worker_venv_path: Optional[str] = None,
+        dp_rank: Optional[int] = None,
+    ) -> None:
         from vllm.lora.request import LoRARequest
 
         super().__init__(config)
         self._worker_venv_path = worker_venv_path
+        self._dp_rank = dp_rank
         self.engine = self._create_engine(config)
         self.lora_adapters: dict[str, LoRARequest] = {}
         self._counter = 1
@@ -213,10 +219,13 @@ class VLLMSamplingBackend(BaseSamplingBackend):
                     "PATH": f"{self._worker_venv_path}/bin:{_path}",
                 },
             }
+        actor_name = f"sampling_model_{self.base_model}"
+        if self._dp_rank is not None:
+            actor_name += f"_dp{self._dp_rank}"
         return (
             ray.remote(vLLMRolloutModel)
             .options(
-                name="sampling_model_" + self.base_model,
+                name=actor_name,
                 num_gpus=config.sampling_memory_fraction,
                 runtime_env=_runtime_env,
             )
@@ -272,10 +281,13 @@ class VLLMSamplingBackend(BaseSamplingBackend):
                     "PATH": f"{self._worker_venv_path}/bin:{_path}",
                 },
             }
+        actor_name = f"sampling_model_{self.base_model}"
+        if self._dp_rank is not None:
+            actor_name += f"_dp{self._dp_rank}"
         return (
             ray.remote(vLLMRolloutModel)
             .options(
-                name="sampling_model_" + self.base_model,
+                name=actor_name,
                 num_gpus=num_gpus,
                 runtime_env=_runtime_env,
             )

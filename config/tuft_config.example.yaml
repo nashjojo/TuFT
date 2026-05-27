@@ -30,6 +30,10 @@ model_owner: local-user
 #
 # Optional model settings:
 #   - tensor_parallel_size: Number of GPUs for tensor parallelism (default: 1)
+#   - data_parallel_size: Number of independent model replicas for data parallel
+#     sampling (default: 1). Use this instead of tensor_parallel_size for small
+#     models that fit on a single GPU to avoid cross-GPU communication overhead.
+#     Total GPUs used = data_parallel_size * tensor_parallel_size.
 #   - temperature: Default sampling temperature (default: 1.0)
 #   - top_p: Default nucleus sampling probability (default: 1.0)
 #   - top_k: Default top-k sampling (default: -1, disabled)
@@ -46,6 +50,7 @@ supported_models:
     model_path: Qwen/Qwen3-4B
     max_model_len: 32768
     tensor_parallel_size: 1
+    data_parallel_size: 2  # run 2 replicas for higher throughput without TP overhead
     temperature: 0.7
     top_p: 1.0
     top_k: -1

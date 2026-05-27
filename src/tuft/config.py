@@ -38,6 +38,7 @@ class ModelConfig(BaseModel):
     model_path: Path  # path to model checkpoint
     max_model_len: int  # maximum context length supported by the model
     tensor_parallel_size: int = 1  # tensor parallel size
+    data_parallel_size: int = 1  # number of independent model replicas for sampling
 
     # default sampling parameters for this model
     temperature: float = 1.0
@@ -77,6 +78,14 @@ class ModelConfig(BaseModel):
     def validate_colocate(self) -> "ModelConfig":
         if self.colocate and self.tensor_parallel_size != 1:
             raise ValueError("Colocate option is only supported for tensor_parallel_size=1.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_data_parallel(self) -> "ModelConfig":
+        if self.data_parallel_size < 1:
+            raise ValueError("data_parallel_size must be >= 1.")
+        if self.data_parallel_size > 1 and self.colocate:
+            raise ValueError("data_parallel_size > 1 is not supported with colocate=True.")
         return self
 
     @model_validator(mode="after")
