@@ -69,13 +69,11 @@ We recommend using [uv](https://github.com/astral-sh/uv) for dependency manageme
 
 ## Install via PyPI
 
-You can also install TuFT directly from PyPI:
-
 ```bash
-uv pip install tuft
+uv pip install "tuft>=0.1.8"
 
 # Install optional dependencies as needed
-uv pip install "tuft[dev,backend,persistence]"
+uv pip install "tuft[dev,backend,persistence]>=0.1.8"
 ```
 
 ## Use the Pre-built Docker Image

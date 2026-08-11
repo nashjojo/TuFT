@@ -38,7 +38,7 @@ This document is organized into two parts:
 ### Install optional dependency
 
 ```bash
-uv pip install "tuft[persistence]"
+uv pip install "tuft[persistence]>=0.1.8"
 ```
 
 ### Enable persistence

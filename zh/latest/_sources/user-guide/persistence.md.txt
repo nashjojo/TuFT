@@ -38,7 +38,7 @@ TuFT 支持**可选的持久化**来保存服务器状态。启用后，TuFT 可
 ### 安装可选依赖
 
 ```bash
-uv pip install "tuft[persistence]"
+uv pip install "tuft[persistence]>=0.1.8"
 ```
 
 ### 启用持久化
