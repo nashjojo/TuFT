@@ -386,8 +386,17 @@ class TrainingController:
         async with record._execution_lock:
             if seq_id is not None:
                 expected = record.next_seq_id
-                if seq_id != expected:
+                if seq_id < expected:
                     raise SequenceConflictException(expected=expected, got=seq_id)
+                if seq_id > expected:
+                    logger.warning(
+                        "Sequence gap on training run %s: expected %s, got %s; "
+                        "fast-forwarding (an earlier request must have failed)",
+                        record.training_run_id,
+                        expected,
+                        seq_id,
+                    )
+                    record.next_seq_id = seq_id
 
             result = await operation()
 

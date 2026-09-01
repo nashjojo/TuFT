@@ -143,18 +143,36 @@ def _prepare_micro_batch(data: list[types.Datum], device: torch.device | str) ->
 
 
 def _compute_target_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Gather label log-probabilities without materializing a full fp32 log-softmax."""
+    """Gather label log-probabilities without materializing a full log-softmax.
 
-    if logits.dtype in (torch.float32, torch.float64):
-        label_logits = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        logsumexp = torch.stack([torch.logsumexp(row, dim=-1) for row in logits])
-        return label_logits - logsumexp
+    A ~32k-token datum against a ~248k vocab makes the [seq, vocab] logits
+    tensor ~16 GiB in bf16; a full log_softmax needs a second logits-sized
+    tensor that stays alive until backward, which OOMs an 80 GiB GPU. Chunking
+    over sequence positions with gather + logsumexp keeps only the logits plus
+    one small chunk workspace: both ops save only small tensors for backward,
+    unlike log_softmax, which saves its entire output.
+    """
 
-    rows = []
-    for row_logits, row_labels in zip(logits, labels, strict=True):
-        row_logprobs = torch.nn.functional.log_softmax(row_logits, dim=-1)
-        rows.append(row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1))
-    return torch.stack(rows)
+    _CHUNK = 8192
+
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_labels = labels.reshape(-1)
+    out = torch.empty(flat_labels.shape, dtype=torch.float32, device=logits.device)
+    for start in range(0, flat_logits.size(0), _CHUNK):
+        end = start + _CHUNK
+        chunk = flat_logits[start:end]
+        # Run outside autocast: autocast promotes logsumexp to fp32, which
+        # materializes a logits-sized fp32 copy per chunk (and its backward
+        # allocates another fp32 chunk-sized temp), reintroducing the very
+        # OOM this chunking exists to avoid. Outside autocast, gather and
+        # logsumexp save only bf16 views plus tiny outputs for backward.
+        with torch.autocast(device_type="cuda", enabled=False):
+            label_logits = torch.gather(
+                chunk, dim=-1, index=flat_labels[start:end].unsqueeze(-1)
+            ).squeeze(-1)
+            logsumexp = torch.logsumexp(chunk, dim=-1)
+        out[start:end] = label_logits.float() - logsumexp.float()
+    return out.view(labels.shape)
 
 
 def _datum_field(
