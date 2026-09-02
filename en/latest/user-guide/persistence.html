@@ -27,13 +27,13 @@
 <link href="../_static/pygments.css?v=03e43079" rel="stylesheet" type="text/css"/>
 <link href="../_static/theme.css?v=d6d7c91b" rel="stylesheet" type="text/css"/>
 <link href="../_static/sphinx-design.min.css?v=95c83b7e" rel="stylesheet" type="text/css"/>
-<link href="../_static/custom.css?v=6dfd5dbd" rel="stylesheet" type="text/css"/>
+<link href="../_static/custom.css?v=ad1d39bd" rel="stylesheet" type="text/css"/>
 <link href="../_static/awesome-sphinx-design.css?v=a81faafa" rel="stylesheet" type="text/css"/>
 <link href="../_static/logo_wo_text.svg" rel="icon"/>
 <link href="../search.html" rel="search" title="Search"/>
 <link href="../genindex.html" rel="index" title="Index"/>
 <link href="telemetry.html" rel="next" title="Observability (OpenTelemetry)"/>
-<link href="on-policy-distillation.html" rel="prev" title="On-Policy Distillation (OPD)"/>
+<link href="lora-target-modules.html" rel="prev" title="LoRA Target Modules"/>
 </head>
 <body :class="{ 'overflow-hidden': showSidebar }" class="min-h-screen font-sans antialiased bg-background text-foreground" x-data="{ showSidebar: false, showScrollTop: false }">
 <div @click.self="showSidebar = false" class="fixed inset-0 z-50 overflow-hidden bg-background/80 backdrop-blur-sm md:hidden" x-cloak="" x-show="showSidebar"></div><div class="relative flex flex-col min-h-screen" id="page"><a class="absolute top-0 left-0 z-[100] block bg-background p-4 text-xl transition -translate-x-full opacity-0 focus:translate-x-0 focus:opacity-100" href="#content">
@@ -107,6 +107,8 @@
 <li class="toctree-l2"><a class="reference internal" href="chat-sft.html">Chat Supervised Fine-Tuning (SFT)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="countdown-rl.html">Countdown Reinforcement Learning (RL)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="on-policy-distillation.html">On-Policy Distillation (OPD)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="custom-losses.html">Custom Losses</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lora-target-modules.html">LoRA Target Modules</a></li>
 <li class="toctree-l2 current"><a class="current reference internal" href="#">Persistence</a></li>
 <li class="toctree-l2"><a class="reference internal" href="telemetry.html">Observability (OpenTelemetry)</a></li>
 <li class="toctree-l2"><a class="reference internal" href="console.html">User console</a></li>
@@ -116,7 +118,6 @@
 <li class="toctree-l2"><a class="reference internal" href="../development/testing.html">Testing Guide</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="../roadmap.html">Roadmap</a></li>
 </ul>
 </nav>
 </div>
@@ -330,6 +331,22 @@
 <li><p>deploy with a <strong>new namespace</strong>, or</p></li>
 <li><p>clear the old namespace explicitly before restart.</p></li>
 </ul>
+<p>Adding persisted model fields can change the configuration signature even when
+the YAML file itself is unchanged. If the computed signature differs from the
+stored signature, TuFT fails preflight with a configuration-mismatch error. Use a
+new namespace or clear the existing one before starting the server. Checkpoint
+files are not deleted by either namespace changes or <code class="docutils literal notranslate"><span class="pre">tuft</span> <span class="pre">clear</span> <span class="pre">persistence</span></code>.</p>
+<p>An FSDP checkpoint can be loaded only into a training run whose effective target
+modules match the checkpoint and the server’s preallocated geometry. For supported
+model series, client LoRA modifiers must resolve to the configured
+<code class="docutils literal notranslate"><span class="pre">fsdp_target_modules</span></code> exactly; TuFT returns HTTP 400 before creating the run when
+they differ. To load a checkpoint with Q/V-only
+<code class="docutils literal notranslate"><span class="pre">target_modules:</span> <span class="pre">[q_proj,</span> <span class="pre">v_proj]</span></code>, set <code class="docutils literal notranslate"><span class="pre">fsdp_qv_only:</span> <span class="pre">true</span></code> on the destination
+model. This dedicated opt-in intentionally overrides client modifiers and records
+Q/V as the run’s effective geometry. Configuring <code class="docutils literal notranslate"><span class="pre">[q_proj,</span> <span class="pre">v_proj]</span></code> only through
+<code class="docutils literal notranslate"><span class="pre">fsdp_target_modules</span></code> is rejected so this override cannot happen accidentally.</p>
+<p>How client LoRA flags resolve to module names and the other target-module
+rules are described in <a class="reference internal" href="lora-target-modules.html"><span class="std std-doc">LoRA Target Modules</span></a>.</p>
 </section>
 </section>
 <hr class="docutils"/>
@@ -564,7 +581,7 @@
 </div>
 </footer>
 </div>
-<script src="../_static/documentation_options.js?v=bafade30"></script>
+<script src="../_static/documentation_options.js?v=938c9ccc"></script>
 <script src="../_static/doctools.js?v=9bcbadda"></script>
 <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
 <script defer="defer" src="../_static/theme.js?v=5db23cf8"></script>

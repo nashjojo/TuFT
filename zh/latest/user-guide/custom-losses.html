@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+
+<html :class="{ 'dark' : darkMode === true }" data-content_root="../" lang="zh-CN" x-data="{ darkMode: $persist(window.matchMedia('(prefers-color-scheme: dark)').matches), activeSection: ''}">
+<head>
+<script>
+    (function () {
+      // Set initial color scheme
+      if ((localStorage.getItem("_x_darkMode") === "true") || (window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+        document.documentElement.classList.add("dark");
+      }
+
+      // Watch for media preference changes
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (event) => {
+        localStorage.setItem("_x_darkMode", event.matches);
+        document.documentElement.classList.toggle("dark", event.matches);
+      });
+    })();
+  </script>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<meta charset="utf-8"/>
+<meta content="#ffffff" media="(prefers-color-scheme: light)" name="theme-color"/>
+<meta content="#030711" media="(prefers-color-scheme: dark)" name="theme-color"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<title>自定义损失 | TuFT</title>
+<meta content="自定义损失 | TuFT" property="og:title"/>
+<meta content="自定义损失 | TuFT" name="twitter:title"/>
+<link href="../_static/pygments.css?v=03e43079" rel="stylesheet" type="text/css"/>
+<link href="../_static/theme.css?v=d6d7c91b" rel="stylesheet" type="text/css"/>
+<link href="../_static/sphinx-design.min.css?v=95c83b7e" rel="stylesheet" type="text/css"/>
+<link href="../_static/custom.css?v=ad1d39bd" rel="stylesheet" type="text/css"/>
+<link href="../_static/awesome-sphinx-design.css?v=a81faafa" rel="stylesheet" type="text/css"/>
+<link href="../_static/logo_wo_text.svg" rel="icon"/>
+<link href="../search.html" rel="search" title="搜索"/>
+<link href="../genindex.html" rel="index" title="索引"/>
+<link href="lora-target-modules.html" rel="next" title="LoRA 目标模块"/>
+<link href="on-policy-distillation.html" rel="prev" title="在策略蒸馏（OPD）"/>
+</head>
+<body :class="{ 'overflow-hidden': showSidebar }" class="min-h-screen font-sans antialiased bg-background text-foreground" x-data="{ showSidebar: false, showScrollTop: false }">
+<div @click.self="showSidebar = false" class="fixed inset-0 z-50 overflow-hidden bg-background/80 backdrop-blur-sm md:hidden" x-cloak="" x-show="showSidebar"></div><div class="relative flex flex-col min-h-screen" id="page"><a class="absolute top-0 left-0 z-[100] block bg-background p-4 text-xl transition -translate-x-full opacity-0 focus:translate-x-0 focus:opacity-100" href="#content">
+      Skip to content
+    </a><header class="sticky top-0 z-40 w-full border-b shadow-xs border-border bg-background/90 backdrop-blur"><div class="container flex items-center h-14">
+<div class="hidden mr-4 md:flex">
+<a class="flex items-center mr-6" href="../index.html">
+<img alt="Logo" class="mr-2 dark:invert" height="24" src="../_static/logo_wo_text.svg" width="24"/><span class="hidden font-bold sm:inline-block text-clip whitespace-nowrap">TuFT</span>
+</a></div><button @click="showSidebar = true" class="inline-flex items-center justify-center h-10 px-0 py-2 mr-2 text-base font-medium transition-colors rounded-md hover:text-accent-foreground hover:bg-transparent md:hidden" type="button">
+<svg aria-hidden="true" fill="currentColor" height="24" viewbox="0 96 960 960" width="24" xmlns="http://www.w3.org/2000/svg">
+<path d="M152.587 825.087q-19.152 0-32.326-13.174t-13.174-32.326q0-19.152 13.174-32.326t32.326-13.174h440q19.152 0 32.326 13.174t13.174 32.326q0 19.152-13.174 32.326t-32.326 13.174h-440Zm0-203.587q-19.152 0-32.326-13.174T107.087 576q0-19.152 13.174-32.326t32.326-13.174h320q19.152 0 32.326 13.174T518.087 576q0 19.152-13.174 32.326T472.587 621.5h-320Zm0-203.587q-19.152 0-32.326-13.174t-13.174-32.326q0-19.152 13.174-32.326t32.326-13.174h440q19.152 0 32.326 13.174t13.174 32.326q0 19.152-13.174 32.326t-32.326 13.174h-440ZM708.913 576l112.174 112.174q12.674 12.674 12.674 31.826t-12.674 31.826Q808.413 764.5 789.261 764.5t-31.826-12.674l-144-144Q600 594.391 600 576t13.435-31.826l144-144q12.674-12.674 31.826-12.674t31.826 12.674q12.674 12.674 12.674 31.826t-12.674 31.826L708.913 576Z"></path>
+</svg>
+<span class="sr-only">Toggle navigation menu</span>
+</button>
+<div class="flex items-center justify-between flex-1 gap-2 sm:gap-4 md:justify-end">
+<div class="flex-1 w-full md:w-auto md:flex-none"><form @keydown.k.window.meta="$refs.search.focus()" action="../search.html" class="relative flex items-center group" id="searchbox" method="get">
+<input aria-label="Search the docs" class="inline-flex items-center font-medium transition-colors bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background border border-input hover:bg-accent focus:bg-accent hover:text-accent-foreground focus:text-accent-foreground hover:placeholder-accent-foreground py-2 px-4 relative h-9 w-full justify-start rounded-[0.5rem] text-sm text-muted-foreground sm:pr-12 md:w-40 lg:w-64" id="search-input" name="q" placeholder="Search ..." type="search" x-ref="search"/>
+<kbd class="pointer-events-none absolute right-1.5 top-2 hidden h-5 select-none text-muted-foreground items-center gap-1 rounded border border-border bg-muted px-1.5 font-mono text-[10px] font-medium opacity-100 sm:flex group-hover:bg-accent group-hover:text-accent-foreground">
+<span class="text-xs">⌘</span>
+    K
+  </kbd>
+</form>
+</div>
+<nav class="flex items-center gap-1">
+<a href="https://qr.dingtalk.com/action/joingroup?code=v1,k1,UWvzO6HHSeuvRQ5WXCOMJEijadQV+hDjhMIpiVr8qCs=&amp;_dt_no_comment=1&amp;origin=11?" rel="noopener nofollow" title="Visit DingTalk">
+<div class="inline-flex items-center justify-center px-0 text-sm font-medium transition-colors rounded-md hover:bg-accent hover:text-accent-foreground h-9 w-9">
+<svg fill="currentColor" height="20" viewbox="0 0 24 24" width="20"><circle cx="12" cy="12" opacity="0.2" r="10"></circle><path d="M8 7h4.5a4.5 4.5 0 0 1 0 9H8z"></path></svg>
+</div>
+</a>
+<a href="https://github.com/agentscope-ai/TuFT" rel="noopener nofollow" title="Visit GitHub">
+<div class="inline-flex items-center justify-center px-0 text-sm font-medium transition-colors rounded-md hover:bg-accent hover:text-accent-foreground h-9 w-9">
+<svg fill="currentColor" height="20" viewbox="0 0 16 16" width="20"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z" fill-rule="evenodd"></path></svg>
+</div>
+</a>
+<a href="https://discord.gg/BCNCaQGxBH" rel="noopener nofollow" title="Visit Discord">
+<div class="inline-flex items-center justify-center px-0 text-sm font-medium transition-colors rounded-md hover:bg-accent hover:text-accent-foreground h-9 w-9">
+<svg fill="currentColor" height="20" viewbox="0 0 16 16" width="20"><path d="M13.545 2.907a13.227 13.227 0 0 0-3.257-1.011.05.05 0 0 0-.052.025c-.141.25-.297.577-.406.833a12.19 12.19 0 0 0-3.658 0 8.258 8.258 0 0 0-.412-.833.051.051 0 0 0-.052-.025c-1.125.194-2.22.534-3.257 1.011a.041.041 0 0 0-.021.018C.356 6.024-.213 9.047.066 12.032c.001.014.01.028.021.037a13.276 13.276 0 0 0 3.995 2.02.05.05 0 0 0 .056-.019c.308-.42.582-.863.818-1.329a.05.05 0 0 0-.01-.059.051.051 0 0 0-.018-.011 8.875 8.875 0 0 1-1.248-.595.05.05 0 0 1-.02-.066.051.051 0 0 1 .015-.019c.084-.063.168-.129.248-.195a.05.05 0 0 1 .051-.007c2.619 1.196 5.454 1.196 8.041 0a.052.052 0 0 1 .053.007c.08.066.164.132.248 .195a.051.051 0 0 1-.004.085 8.254 8.254 0 0 1-1.249 .594.05.05 0 0 0-.03.03.052.052 0 0 0 .003.041c.24.465.515.909.817 1.329a.05.05 0 0 0 .056.019 13.235 13.235 0 0 0 4.001-2.02.049.049 0 0 0 .021-.037c.334-3.451-.559-6.449-2.366-9.106a.034.034 0 0 0-.02-.019Zm-8.198 7.307c-.789 0-1.438-.724-1.438-1.612 0-.889.637-1.613 1.438-1.613.807 0 1.45.73 1.438 1.613 0 .888-.637 1.612-1.438 1.612Zm5.316 0c-.788 0-1.438-.724-1.438-1.612 0-.889.637-1.613 1.438-1.613.807 0 1.451.73 1.438 1.613 0 .888-.631 1.612-1.438 1.612Z"></path></svg>
+</div>
+</a>
+<button @click="darkMode = !darkMode" class="relative inline-flex items-center justify-center px-0 text-sm font-medium transition-colors rounded-md hover:bg-accent hover:text-accent-foreground h-9 w-9" title="Toggle color scheme" type="button">
+<svg class="absolute transition-all scale-100 rotate-0 dark:-rotate-90 dark:scale-0" fill="currentColor" height="16" viewbox="0 96 960 960" width="16" xmlns="http://www.w3.org/2000/svg">
+<path d="M480 685q45.456 0 77.228-31.772Q589 621.456 589 576q0-45.456-31.772-77.228Q525.456 467 480 467q-45.456 0-77.228 31.772Q371 530.544 371 576q0 45.456 31.772 77.228Q434.544 685 480 685Zm0 91q-83 0-141.5-58.5T280 576q0-83 58.5-141.5T480 376q83 0 141.5 58.5T680 576q0 83-58.5 141.5T480 776ZM80 621.5q-19.152 0-32.326-13.174T34.5 576q0-19.152 13.174-32.326T80 530.5h80q19.152 0 32.326 13.174T205.5 576q0 19.152-13.174 32.326T160 621.5H80Zm720 0q-19.152 0-32.326-13.174T754.5 576q0-19.152 13.174-32.326T800 530.5h80q19.152 0 32.326 13.174T925.5 576q0 19.152-13.174 32.326T880 621.5h-80Zm-320-320q-19.152 0-32.326-13.174T434.5 256v-80q0-19.152 13.174-32.326T480 130.5q19.152 0 32.326 13.174T525.5 176v80q0 19.152-13.174 32.326T480 301.5Zm0 720q-19.152 0-32.326-13.17Q434.5 995.152 434.5 976v-80q0-19.152 13.174-32.326T480 850.5q19.152 0 32.326 13.174T525.5 896v80q0 19.152-13.174 32.33-13.174 13.17-32.326 13.17ZM222.174 382.065l-43-42Q165.5 327.391 166 308.239t13.174-33.065q13.435-13.674 32.587-13.674t32.065 13.674l42.239 43q12.674 13.435 12.555 31.706-.12 18.272-12.555 31.946-12.674 13.674-31.445 13.413-18.772-.261-32.446-13.174Zm494 494.761-42.239-43q-12.674-13.435-12.674-32.087t12.674-31.565Q686.609 756.5 705.38 757q18.772.5 32.446 13.174l43 41.761Q794.5 824.609 794 843.761t-13.174 33.065Q767.391 890.5 748.239 890.5t-32.065-13.674Zm-42-494.761Q660.5 369.391 661 350.62q.5-18.772 13.174-32.446l41.761-43Q728.609 261.5 747.761 262t33.065 13.174q13.674 13.435 13.674 32.587t-13.674 32.065l-43 42.239q-13.435 12.674-31.706 12.555-18.272-.12-31.946-12.555Zm-495 494.761Q165.5 863.391 165.5 844.239t13.674-32.065l43-42.239q13.435-12.674 32.087-12.674t31.565 12.674Q299.5 782.609 299 801.38q-.5 18.772-13.174 32.446l-41.761 43Q231.391 890.5 212.239 890t-33.065-13.174ZM480 576Z"></path>
+</svg>
+<svg class="absolute transition-all scale-0 rotate-90 dark:rotate-0 dark:scale-100" fill="currentColor" height="16" viewbox="0 96 960 960" width="16" xmlns="http://www.w3.org/2000/svg">
+<path d="M480 936q-151 0-255.5-104.5T120 576q0-138 90-239.5T440 218q25-3 39 18t-1 44q-17 26-25.5 55t-8.5 61q0 90 63 153t153 63q31 0 61.5-9t54.5-25q21-14 43-1.5t19 39.5q-14 138-117.5 229T480 936Zm0-80q88 0 158-48.5T740 681q-20 5-40 8t-40 3q-123 0-209.5-86.5T364 396q0-20 3-40t8-40q-78 32-126.5 102T200 576q0 116 82 198t198 82Zm-10-270Z"></path>
+</svg>
+</button>
+</nav>
+</div>
+</div>
+</header>
+<div class="flex-1"><div class="container md:grid md:grid-cols-[220px_minmax(0,1fr)] md:gap-6 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-10"><aside :aria-hidden="!showSidebar" :class="{ 'translate-x-0': showSidebar }" class="fixed inset-y-0 left-0 md:top-14 z-50 md:z-30 bg-background md:bg-transparent transition-all duration-100 -translate-x-full md:translate-x-0 ml-0 p-6 md:p-0 md:-ml-2 md:h-[calc(100vh-3.5rem)] w-5/6 md:w-full overflow-y-auto border-r border-border md:sticky" id="left-sidebar">
+<a class="justify-start text-sm md:!hidden bg-background" href="../index.html">
+<img alt="Logo" class="mr-2 dark:invert" height="16" src="../_static/logo_wo_text.svg" width="16"/><span class="font-bold text-clip whitespace-nowrap">TuFT</span>
+</a>
+<div class="relative overflow-hidden md:overflow-auto my-4 md:my-0">
+<div class="overflow-y-auto h-full w-full relative pr-6"><nav class="table w-full min-w-full my-6 lg:my-8">
+<ul class="current">
+<li class="toctree-l1" x-data="{ expanded: $el.classList.contains('current') ? true : false }"><a :class="{ 'expanded' : expanded }" @click="expanded = !expanded" class="reference internal expandable" href="../getting-started/index.html">入门指南<button @click.prevent.stop="expanded = !expanded" type="button" x-cloak=""><span class="sr-only"></span><svg fill="currentColor" height="18px" stroke="none" viewbox="0 0 24 24" width="18px" xmlns="http://www.w3.org/2000/svg"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"></path></svg></button></a><ul x-cloak="" x-show="expanded">
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/installation.html">安装指南</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/quickstart.html">快速开始</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../getting-started/embedded-mode.html">嵌入式模式</a></li>
+</ul>
+</li>
+<li class="toctree-l1" x-data="{ expanded: $el.classList.contains('current') ? true : false }"><a :class="{ 'expanded' : expanded }" @click="expanded = !expanded" class="reference internal expandable" href="../deployment/index.html">部署<button @click.prevent.stop="expanded = !expanded" type="button" x-cloak=""><span class="sr-only"></span><svg fill="currentColor" height="18px" stroke="none" viewbox="0 0 24 24" width="18px" xmlns="http://www.w3.org/2000/svg"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"></path></svg></button></a><ul x-cloak="" x-show="expanded">
+<li class="toctree-l2"><a class="reference internal" href="../deployment/modal.html">在 Modal 上部署</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../deployment/lambda.html">在 Lambda Cloud 上部署</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current" x-data="{ expanded: $el.classList.contains('current') ? true : false }"><a :class="{ 'expanded' : expanded }" @click="expanded = !expanded" class="reference internal expandable" href="index.html">用户指南<button @click.prevent.stop="expanded = !expanded" type="button" x-cloak=""><span class="sr-only"></span><svg fill="currentColor" height="18px" stroke="none" viewbox="0 0 24 24" width="18px" xmlns="http://www.w3.org/2000/svg"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"></path></svg></button></a><ul class="current" x-show="expanded">
+<li class="toctree-l2"><a class="reference internal" href="chat-sft.html">Chat 监督微调（SFT）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="countdown-rl.html">Countdown 强化学习（RL）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="on-policy-distillation.html">在策略蒸馏（OPD）</a></li>
+<li class="toctree-l2 current"><a class="current reference internal" href="#">自定义损失</a></li>
+<li class="toctree-l2"><a class="reference internal" href="lora-target-modules.html">LoRA 目标模块</a></li>
+<li class="toctree-l2"><a class="reference internal" href="persistence.html">持久化</a></li>
+<li class="toctree-l2"><a class="reference internal" href="telemetry.html">可观测性（OpenTelemetry）</a></li>
+<li class="toctree-l2"><a class="reference internal" href="console.html">控制台</a></li>
+</ul>
+</li>
+<li class="toctree-l1" x-data="{ expanded: $el.classList.contains('current') ? true : false }"><a :class="{ 'expanded' : expanded }" @click="expanded = !expanded" class="reference internal expandable" href="../development/index.html">开发指南<button @click.prevent.stop="expanded = !expanded" type="button" x-cloak=""><span class="sr-only"></span><svg fill="currentColor" height="18px" stroke="none" viewbox="0 0 24 24" width="18px" xmlns="http://www.w3.org/2000/svg"><path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"></path></svg></button></a><ul x-cloak="" x-show="expanded">
+<li class="toctree-l2"><a class="reference internal" href="../development/testing.html">测试指南</a></li>
+</ul>
+</li>
+</ul>
+</nav>
+</div>
+</div>
+<button @click="showSidebar = false" class="absolute md:hidden right-4 top-4 rounded-sm opacity-70 transition-opacity hover:opacity-100" type="button">
+<svg class="h-4 w-4" fill="currentColor" height="24" stroke="none" viewbox="0 96 960 960" width="24" xmlns="http://www.w3.org/2000/svg">
+<path d="M480 632 284 828q-11 11-28 11t-28-11q-11-11-11-28t11-28l196-196-196-196q-11-11-11-28t11-28q11-11 28-11t28 11l196 196 196-196q11-11 28-11t28 11q11 11 11 28t-11 28L536 576l196 196q11 11 11 28t-11 28q-11 11-28 11t-28-11L480 632Z"></path>
+</svg>
+</button>
+</aside>
+<main class="relative py-6 lg:gap-10 lg:py-8 xl:grid xl:grid-cols-[1fr_300px]">
+<div class="w-full min-w-0 mx-auto">
+<nav aria-label="breadcrumbs" class="flex items-center mb-4 space-x-1 text-sm text-muted-foreground">
+<a class="overflow-hidden text-ellipsis whitespace-nowrap hover:text-foreground" href="../index.html">
+<span class="hidden md:inline">TuFT</span>
+<svg aria-label="Home" class="md:hidden" fill="currentColor" height="18" stroke="none" viewbox="0 96 960 960" width="18" xmlns="http://www.w3.org/2000/svg">
+<path d="M240 856h120V616h240v240h120V496L480 316 240 496v360Zm-80 80V456l320-240 320 240v480H520V696h-80v240H160Zm320-350Z"></path>
+</svg>
+</a>
+<div class="mr-1">/</div><a class="hover:text-foreground overflow-hidden text-ellipsis whitespace-nowrap" href="index.html">用户指南</a>
+<div class="mr-1">/</div><span aria-current="page" class="font-medium text-foreground overflow-hidden text-ellipsis whitespace-nowrap">自定义损失</span>
+</nav>
+<div id="content" role="main">
+<section class="tex2jax_ignore mathjax_ignore" id="id1">
+<h1>自定义损失<a class="headerlink" href="#id1" title="Link to this heading">¶</a></h1>
+<p>使用 Tinker SDK 的 <code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code> 方法，可以把 TuFT 的训练损失写成一个普通的 PyTorch 函数——例如把直接偏好优化（DPO）与负对数似然（NLL）组合起来。自定义损失同时支持两种训练后端（<code class="docutils literal notranslate"><span class="pre">hf</span></code> 与 <code class="docutils literal notranslate"><span class="pre">fsdp</span></code>）。你的函数只在客户端进程中运行；服务器只执行自己内置的损失。</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><code><span id="line-1"><span class="k">def</span><span class="w"> </span><span class="nf">my_loss</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">types</span><span class="o">.</span><span class="n">Datum</span><span class="p">],</span> <span class="n">logprobs_list</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+</span><span id="line-2">    <span class="c1"># 把逐 token 对数概率组合成一个可微的标量。</span>
+</span><span id="line-3">    <span class="n">loss</span> <span class="o">=</span> <span class="o">...</span>
+</span><span id="line-4">    <span class="c1"># 指标必须是普通的 float，会随训练结果一并返回。</span>
+</span><span id="line-5">    <span class="k">return</span> <span class="n">loss</span><span class="p">,</span> <span class="p">{</span><span class="s2">"my_metric:sum"</span><span class="p">:</span> <span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">()}</span>
+</span><span id="line-6">
+</span><span id="line-7">
+</span><span id="line-8"><span class="n">training_client</span><span class="o">.</span><span class="n">forward_backward_custom</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">my_loss</span><span class="p">,</span> <span class="n">loss_type_input</span><span class="o">=</span><span class="s2">"logprobs"</span><span class="p">)</span>
+</span></code></pre></div>
+</div>
+<hr class="docutils"/>
+<section id="id2">
+<h2>您将学到<a class="headerlink" href="#id2" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id2'">¶</a></h2>
+<ol class="arabic simple">
+<li><p>什么时候该用 <code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code>，而不是内置的 <code class="docutils literal notranslate"><span class="pre">loss_fn</span></code></p></li>
+<li><p>一次自定义损失调用中，客户端和服务器各做了什么</p></li>
+<li><p>支持哪些输入，以及返回的分数如何与每个 datum 对齐</p></li>
+<li><p>两个可直接运行的示例：监督微调，以及 DPO + NLL</p></li>
+<li><p>运行时开销、常见错误，以及自定义步骤有何不同</p></li>
+</ol>
+</section>
+<hr class="docutils"/>
+<section id="id3">
+<h2>目录<a class="headerlink" href="#id3" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id3'">¶</a></h2>
+<ol class="arabic simple">
+<li><p><a class="reference internal" href="#id4">何时使用自定义损失</a></p></li>
+<li><p><a class="reference internal" href="#id5">自定义损失的工作原理</a></p></li>
+<li><p><a class="reference internal" href="#id6">监督微调示例</a></p></li>
+<li><p><a class="reference internal" href="#dpo-nll">DPO + NLL 示例</a></p></li>
+<li><p><a class="reference internal" href="#id7">支持的输入</a></p></li>
+<li><p><a class="reference internal" href="#id8">运行时开销</a></p></li>
+<li><p><a class="reference internal" href="#id9">错误处理</a></p></li>
+<li><p><a class="reference internal" href="#id10">自定义步骤有何不同</a></p></li>
+<li><p><a class="reference internal" href="#id11">常见问题</a></p></li>
+</ol>
+</section>
+<hr class="docutils"/>
+<section id="id4">
+<h2>何时使用自定义损失<a class="headerlink" href="#id4" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id4'">¶</a></h2>
+<p>TuFT 内置五个服务器端损失函数——<code class="docutils literal notranslate"><span class="pre">cross_entropy</span></code>、<code class="docutils literal notranslate"><span class="pre">importance_sampling</span></code>、<code class="docutils literal notranslate"><span class="pre">ppo</span></code>、<code class="docutils literal notranslate"><span class="pre">cispo</span></code> 和 <code class="docutils literal notranslate"><span class="pre">dro</span></code>——在 <code class="docutils literal notranslate"><span class="pre">forward_backward(data,</span> <span class="pre">loss_fn=...)</span></code> 中按名称选用。服务器只接受这五个名称，因此客户端无法在共享基础设施上运行任意 Python 代码。</p>
+<p>当你的目标函数是<strong>逐 token 目标对数概率</strong>的可微函数、却不在这五个之列时，就该用 <code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code> 了。典型场景：</p>
+<ul class="simple">
+<li><p><strong>偏好类损失</strong>，例如比较 chosen 与 rejected 回复的 DPO。</p></li>
+<li><p><strong>组合损失</strong>，例如 DPO 加上带权 NLL，或再加一个策略/参考模型稳定项。</p></li>
+<li><p>研究新损失时的快速迭代，无需改动服务器。</p></li>
+</ul>
+<p>如果你的目标函数<em>恰好</em>是某个内置损失，请优先用 <code class="docutils literal notranslate"><span class="pre">forward_backward</span></code>：它每步能省下一次前向计算（<a class="reference internal" href="#id8">详见下文</a>）。</p>
+<div class="note admonition">
+<p class="admonition-title">前置要求</p>
+<p><code class="docutils literal notranslate"><span class="pre">tinker</span></code> ≥ 0.25（TuFT 锁定的 SDK 版本），且<strong>客户端</strong>装有 <code class="docutils literal notranslate"><span class="pre">torch</span></code>。自定义回调只在你自己的进程中运行——TuFT 服务器永远不会导入或执行客户端的 Python 代码，也没有新增任何服务器端损失名称。</p>
+</div>
+</section>
+<hr class="docutils"/>
+<section id="id5">
+<h2>自定义损失的工作原理<a class="headerlink" href="#id5" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id5'">¶</a></h2>
+<p><strong>对数概率</strong>是模型给目标 token 打出的分数，以对数刻度表示。<strong>梯度</strong>描述模型中某个值发生变化时，损失会如何随之变化。TuFT 靠这两样东西，就能在不把你的 Python 函数发给服务器的前提下，用你的损失来训练。</p>
+<figure class="align-center" id="id12">
+<a class="reference internal image-reference" href="../_images/custom-loss-two-pass.svg"><img alt="自定义损失调用先从服务器读取 token 对数概率，在客户端计算损失及其导数，再把 token 权重发回服务器进行第二遍计算，累积模型梯度。" src="../_images/custom-loss-two-pass.svg" style="width: 820px;"/>
+</a>
+<figcaption>
+<p><span class="caption-text">客户端在两遍服务器计算之间完成自定义损失的计算。</span><a class="headerlink" href="#id12" title="Link to this image">¶</a></p>
+</figcaption>
+</figure>
+<ol class="arabic simple">
+<li><p>服务器为每个目标 token 打分并返回这些对数概率。这一遍不更新模型，也不保存梯度。</p></li>
+<li><p>你的 PyTorch 回调把这些分数组合成一个损失。PyTorch 会算出损失对每个返回分数的变化率。</p></li>
+<li><p>客户端把这些值作为 token 权重发回。服务器对同一批数据再打一遍分并执行反向传播，从而累积出自定义损失的模型梯度。</p></li>
+</ol>
+<p>下面解释为什么最后一步等价于直接用你的损失训练。设 <span class="math notranslate nohighlight">\(\theta\)</span> 为全部模型参数，<span class="math notranslate nohighlight">\(\ell_i(\theta)\)</span> 为目标 token <span class="math notranslate nohighlight">\(i\)</span> 的对数概率。你的回调把这些值组合成自定义损失 <span class="math notranslate nohighlight">\(C\)</span>。在客户端上，PyTorch 为每个 token 计算一个导数：</p>
+<div class="math notranslate nohighlight">
+\[g_i = \frac{\partial C}{\partial \ell_i}.\]</div>
+<p><span class="math notranslate nohighlight">\(g_i\)</span> 表示 token <span class="math notranslate nohighlight">\(i\)</span> 的对数概率发生微小变化时，自定义损失会变化多少。客户端把 <span class="math notranslate nohighlight">\(w_i = -g_i\)</span> 发给服务器。服务器把每个权重当作固定常数，计算辅助损失：</p>
+<div class="math notranslate nohighlight">
+\[H(\theta) = -\sum_i w_i\,\ell_i(\theta).\]</div>
+<p>服务器对 <span class="math notranslate nohighlight">\(H\)</span> 关于模型参数求导时，两个负号相互抵消：</p>
+<div class="math notranslate nohighlight">
+\[\nabla_\theta H
+= -\sum_i w_i\,\nabla_\theta \ell_i
+= \sum_i g_i\,\nabla_\theta \ell_i
+= \nabla_\theta C.\]</div>
+<p>最后一个等号正是链式法则：每个 token 以 <span class="math notranslate nohighlight">\(g_i\)</span> 影响自定义损失，每个模型参数又以 <span class="math notranslate nohighlight">\(\nabla_\theta \ell_i\)</span> 影响该 token；把这些路径加总，得到的就是自定义损失对参数的梯度。<span class="math notranslate nohighlight">\(H\)</span> 与 <span class="math notranslate nohighlight">\(C\)</span> 的数值不必相等；优化器用的是两者的参数梯度，而它们是一致的。</p>
+<p>这个等价性要求两遍服务器计算使用同一组模型参数。正常的串行用法天然满足：等 <code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code> 完成后，再调用 <code class="docutils literal notranslate"><span class="pre">optim_step</span></code>。</p>
+</section>
+<hr class="docutils"/>
+<section id="id6">
+<h2>监督微调示例<a class="headerlink" href="#id6" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id6'">¶</a></h2>
+<p>可在任何 TuFT 服务器（HF 或 FSDP 后端）上运行——先按<a class="reference internal" href="../getting-started/quickstart.html"><span class="std std-doc">快速开始</span></a>启动一台服务器，然后：</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><code><span id="line-1"><span class="kn">import</span><span class="w"> </span><span class="nn">tinker</span>
+</span><span id="line-2"><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+</span><span id="line-3"><span class="kn">from</span><span class="w"> </span><span class="nn">tinker</span><span class="w"> </span><span class="kn">import</span> <span class="n">types</span>
+</span><span id="line-4">
+</span><span id="line-5"><span class="n">service_client</span> <span class="o">=</span> <span class="n">tinker</span><span class="o">.</span><span class="n">ServiceClient</span><span class="p">(</span><span class="n">base_url</span><span class="o">=</span><span class="s2">"http://localhost:10610"</span><span class="p">,</span> <span class="n">api_key</span><span class="o">=</span><span class="s2">"local-dev-key"</span><span class="p">)</span>
+</span><span id="line-6"><span class="n">base_model</span> <span class="o">=</span> <span class="n">service_client</span><span class="o">.</span><span class="n">get_server_capabilities</span><span class="p">()</span><span class="o">.</span><span class="n">supported_models</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">model_name</span>
+</span><span id="line-7"><span class="n">training_client</span> <span class="o">=</span> <span class="n">service_client</span><span class="o">.</span><span class="n">create_lora_training_client</span><span class="p">(</span>
+</span><span id="line-8">    <span class="n">base_model</span><span class="o">=</span><span class="n">base_model</span><span class="p">,</span> <span class="n">rank</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="n">train_unembed</span><span class="o">=</span><span class="kc">False</span>
+</span><span id="line-9"><span class="p">)</span>
+</span><span id="line-10"><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">training_client</span><span class="o">.</span><span class="n">get_tokenizer</span><span class="p">()</span>
+</span><span id="line-11">
+</span><span id="line-12">
+</span><span id="line-13"><span class="k">def</span><span class="w"> </span><span class="nf">make_datum</span><span class="p">(</span><span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">completion</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">types</span><span class="o">.</span><span class="n">Datum</span><span class="p">:</span>
+</span><span id="line-14">    <span class="c1"># 特殊 token 只加一次，放在整条序列的开头。</span>
+</span><span id="line-15">    <span class="n">prompt_tokens</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</span><span id="line-16">    <span class="n">completion_tokens</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">completion</span><span class="p">,</span> <span class="n">add_special_tokens</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</span><span id="line-17">    <span class="n">tokens</span> <span class="o">=</span> <span class="n">prompt_tokens</span> <span class="o">+</span> <span class="n">completion_tokens</span>
+</span><span id="line-18">    <span class="c1"># 整体右移一位：每个输入位置预测下一个目标 token。</span>
+</span><span id="line-19">    <span class="c1"># 权重为 0 时忽略提示词 token，为 1 时在补全 token 上训练。</span>
+</span><span id="line-20">    <span class="n">weights</span> <span class="o">=</span> <span class="p">[</span><span class="mf">0.0</span><span class="p">]</span> <span class="o">*</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">prompt_tokens</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="p">[</span><span class="mf">1.0</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">completion_tokens</span><span class="p">)</span>
+</span><span id="line-21">    <span class="k">return</span> <span class="n">types</span><span class="o">.</span><span class="n">Datum</span><span class="p">(</span>
+</span><span id="line-22">        <span class="n">model_input</span><span class="o">=</span><span class="n">types</span><span class="o">.</span><span class="n">ModelInput</span><span class="o">.</span><span class="n">from_ints</span><span class="p">(</span><span class="n">tokens</span><span class="p">[:</span><span class="o">-</span><span class="mi">1</span><span class="p">]),</span>
+</span><span id="line-23">        <span class="n">loss_fn_inputs</span><span class="o">=</span><span class="p">{</span>
+</span><span id="line-24">            <span class="s2">"target_tokens"</span><span class="p">:</span> <span class="n">types</span><span class="o">.</span><span class="n">TensorData</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="n">tokens</span><span class="p">[</span><span class="mi">1</span><span class="p">:],</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"int64"</span><span class="p">),</span>
+</span><span id="line-25">            <span class="s2">"weights"</span><span class="p">:</span> <span class="n">types</span><span class="o">.</span><span class="n">TensorData</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="n">weights</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="s2">"float32"</span><span class="p">),</span>
+</span><span id="line-26">        <span class="p">},</span>
+</span><span id="line-27">    <span class="p">)</span>
+</span><span id="line-28">
+</span><span id="line-29">
+</span><span id="line-30"><span class="n">data</span> <span class="o">=</span> <span class="p">[</span>
+</span><span id="line-31">    <span class="n">make_datum</span><span class="p">(</span><span class="s2">"English: hello world</span><span class="se">\n</span><span class="s2">Pig Latin:"</span><span class="p">,</span> <span class="s2">" ello-hay orld-way</span><span class="se">\n</span><span class="s2">"</span><span class="p">),</span>
+</span><span id="line-32">    <span class="n">make_datum</span><span class="p">(</span><span class="s2">"English: banana split</span><span class="se">\n</span><span class="s2">Pig Latin:"</span><span class="p">,</span> <span class="s2">" anana-bay plit-say</span><span class="se">\n</span><span class="s2">"</span><span class="p">),</span>
+</span><span id="line-33"><span class="p">]</span>
+</span><span id="line-34">
+</span><span id="line-35">
+</span><span id="line-36"><span class="k">def</span><span class="w"> </span><span class="nf">sft_loss</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">types</span><span class="o">.</span><span class="n">Datum</span><span class="p">],</span> <span class="n">logprobs_list</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+</span><span id="line-37"><span class="w">    </span><span class="sd">"""先算每个样本回复 token 的平均 NLL，再取批次均值。"""</span>
+</span><span id="line-38">    <span class="n">per_example_nlls</span> <span class="o">=</span> <span class="p">[]</span>
+</span><span id="line-39">    <span class="k">for</span> <span class="n">datum</span><span class="p">,</span> <span class="n">logprobs</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">logprobs_list</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+</span><span id="line-40">        <span class="c1"># 复用 datum 的权重作为回复 token 的 0/1 掩码。</span>
+</span><span id="line-41">        <span class="n">weights</span> <span class="o">=</span> <span class="n">datum</span><span class="o">.</span><span class="n">loss_fn_inputs</span><span class="p">[</span><span class="s2">"weights"</span><span class="p">]</span><span class="o">.</span><span class="n">to_torch</span><span class="p">()</span>
+</span><span id="line-42">        <span class="c1"># 对每条回复单独归一化，避免长回复主导整个批次。</span>
+</span><span id="line-43">        <span class="n">response_token_count</span> <span class="o">=</span> <span class="n">weights</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span><span class="o">.</span><span class="n">clamp_min</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+</span><span id="line-44">        <span class="n">per_example_nlls</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="n">logprobs</span> <span class="o">*</span> <span class="n">weights</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">/</span> <span class="n">response_token_count</span><span class="p">)</span>
+</span><span id="line-45">    <span class="c1"># 无论回复长短，每个样本的权重相同。</span>
+</span><span id="line-46">    <span class="n">loss</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">per_example_nlls</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</span><span id="line-47">    <span class="k">return</span> <span class="n">loss</span><span class="p">,</span> <span class="p">{</span><span class="s2">"sft_nll:mean"</span><span class="p">:</span> <span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">()}</span>
+</span><span id="line-48">
+</span><span id="line-49">
+</span><span id="line-50"><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+</span><span id="line-51">    <span class="c1"># 先为该批次累积梯度，再一次性更新 LoRA 参数。</span>
+</span><span id="line-52">    <span class="n">result</span> <span class="o">=</span> <span class="n">training_client</span><span class="o">.</span><span class="n">forward_backward_custom</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">sft_loss</span><span class="p">)</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+</span><span id="line-53">    <span class="n">training_client</span><span class="o">.</span><span class="n">optim_step</span><span class="p">(</span><span class="n">types</span><span class="o">.</span><span class="n">AdamParams</span><span class="p">(</span><span class="n">learning_rate</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">))</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+</span><span id="line-54">    <span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">metrics</span><span class="p">[</span><span class="s2">"sft_nll:mean"</span><span class="p">])</span>
+</span></code></pre></div>
+</div>
+<p>回调<strong>按顺序</strong>收到与 <code class="docutils literal notranslate"><span class="pre">data[i]</span></code> 一一对应的 <code class="docutils literal notranslate"><span class="pre">logprobs_list[i]</span></code>，每个都是长度为 <code class="docutils literal notranslate"><span class="pre">len(data[i].model_input)</span></code> 的一维 float32 张量——<code class="docutils literal notranslate"><span class="pre">logprobs_list[i][t]</span></code> 是当前模型在位置 <code class="docutils literal notranslate"><span class="pre">t</span></code> 上赋予 <code class="docutils literal notranslate"><span class="pre">target_tokens[t]</span></code> 的对数概率。你返回的指标字典会与服务器的辅助损失指标一起合并进 <code class="docutils literal notranslate"><span class="pre">result.metrics</span></code>。</p>
+</section>
+<hr class="docutils"/>
+<section id="dpo-nll">
+<h2>DPO + NLL 示例<a class="headerlink" href="#dpo-nll" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#dpo-nll'">¶</a></h2>
+<p>直接偏好优化（DPO）训练模型给 chosen 回复打出高于 rejected 回复的分数。偏好项的定义出自 <a class="reference external" href="https://arxiv.org/abs/2305.18290">DPO 原始论文</a>。<a class="reference external" href="https://arxiv.org/abs/2511.01689">Open Character Training</a> 在其基础上组合了 chosen 回复的平均负对数似然（NLL）和一个小的逐 token 稳定项。在 DPO 上叠加 chosen NLL 的做法也见于 <a class="reference external" href="https://arxiv.org/abs/2405.16436">Regularized Preference Optimization</a>。</p>
+<p>对每条回复，示例先在回复 token 上对策略与参考模型的对数概率之差求和；DPO 在每对 chosen/rejected 内部比较这两个和。完整的批次损失为：</p>
+<div class="math notranslate nohighlight">
+\[L = L_{\mathrm{DPO}} + \lambda_{\mathrm{NLL}} L_{\mathrm{NLL}}
+    + \lambda_{\mathrm{proxy}} L_{\mathrm{proxy}}.\]</div>
+<p><code class="docutils literal notranslate"><span class="pre">L_proxy</span></code> 是采样回复 token 上策略/参考对数比值的均方。Open Character Training 的代码用它充当轻量的 KL 散度代理。它并不是全词表上的精确 KL——仅凭目标 token 的对数概率算不出后者。</p>
+<p>datum 按 <code class="docutils literal notranslate"><span class="pre">(chosen,</span> <span class="pre">rejected)</span></code> 的顺序排列，并在第一次优化器更新之前一次性取得参考对数概率：</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><code><span id="line-1"><span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+</span><span id="line-2">
+</span><span id="line-3"><span class="c1"># 相邻的两个 datum 共享同一提示词，chosen 回复必须在前。</span>
+</span><span id="line-4"><span class="c1"># make_datum 给提示词 token 权重 0.0，回复 token 权重 1.0。</span>
+</span><span id="line-5"><span class="c1"># data = [chosen_0, rejected_0, chosen_1, rejected_1, ...]</span>
+</span><span id="line-6">
+</span><span id="line-7"><span class="c1"># 保存初始策略的快照。策略训练期间这些张量保持不变。</span>
+</span><span id="line-8"><span class="n">reference_result</span> <span class="o">=</span> <span class="n">training_client</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="s2">"cross_entropy"</span><span class="p">)</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+</span><span id="line-9"><span class="n">reference_logprobs</span> <span class="o">=</span> <span class="p">[</span>
+</span><span id="line-10">    <span class="n">output</span><span class="p">[</span><span class="s2">"logprobs"</span><span class="p">]</span><span class="o">.</span><span class="n">to_torch</span><span class="p">()</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+</span><span id="line-11">    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">reference_result</span><span class="o">.</span><span class="n">loss_fn_outputs</span>
+</span><span id="line-12"><span class="p">]</span>
+</span><span id="line-13">
+</span><span id="line-14"><span class="c1"># 这些取值复现 Open Character Training 的配方；请针对你的数据调整。</span>
+</span><span id="line-15"><span class="n">BETA</span> <span class="o">=</span> <span class="mf">0.1</span>  <span class="c1"># 控制 DPO 拉开 chosen 与 rejected 差距的力度。</span>
+</span><span id="line-16"><span class="n">NLL_COEF</span> <span class="o">=</span> <span class="mf">0.1</span>  <span class="c1"># 维持 chosen 回复在策略下的似然。</span>
+</span><span id="line-17"><span class="n">KL_PROXY_COEF</span> <span class="o">=</span> <span class="mf">0.001</span>  <span class="c1"># 限制在采样 token 上偏离参考模型的幅度。</span>
+</span><span id="line-18">
+</span><span id="line-19">
+</span><span id="line-20"><span class="k">def</span><span class="w"> </span><span class="nf">dpo_composite_loss</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">types</span><span class="o">.</span><span class="n">Datum</span><span class="p">],</span> <span class="n">logprobs_list</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+</span><span id="line-21">    <span class="k">if</span> <span class="ow">not</span> <span class="n">data</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">:</span>
+</span><span id="line-22">        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"DPO data must contain one or more complete chosen/rejected pairs"</span><span class="p">)</span>
+</span><span id="line-23">
+</span><span id="line-24">    <span class="n">sequence_logratios</span> <span class="o">=</span> <span class="p">[]</span>
+</span><span id="line-25">    <span class="n">response_nlls</span> <span class="o">=</span> <span class="p">[]</span>
+</span><span id="line-26">    <span class="n">kl_proxy_terms</span> <span class="o">=</span> <span class="p">[]</span>
+</span><span id="line-27">    <span class="k">for</span> <span class="n">datum</span><span class="p">,</span> <span class="n">logprobs</span><span class="p">,</span> <span class="n">reference</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span>
+</span><span id="line-28">        <span class="n">data</span><span class="p">,</span> <span class="n">logprobs_list</span><span class="p">,</span> <span class="n">reference_logprobs</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span>
+</span><span id="line-29">    <span class="p">):</span>
+</span><span id="line-30">        <span class="c1"># 只选取回复 token；提示词 token 不得影响损失。</span>
+</span><span id="line-31">        <span class="n">response_mask</span> <span class="o">=</span> <span class="n">datum</span><span class="o">.</span><span class="n">loss_fn_inputs</span><span class="p">[</span><span class="s2">"weights"</span><span class="p">]</span><span class="o">.</span><span class="n">to_torch</span><span class="p">()</span><span class="o">.</span><span class="n">bool</span><span class="p">()</span>
+</span><span id="line-32">        <span class="k">if</span> <span class="ow">not</span> <span class="n">response_mask</span><span class="o">.</span><span class="n">any</span><span class="p">()</span><span class="o">.</span><span class="n">item</span><span class="p">():</span>
+</span><span id="line-33">            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"each DPO response must contain at least one token"</span><span class="p">)</span>
+</span><span id="line-34">
+</span><span id="line-35">        <span class="c1"># DPO 使用序列对数比值：log π_policy(response) - log π_ref(response)。</span>
+</span><span id="line-36">        <span class="n">logratio</span> <span class="o">=</span> <span class="n">logprobs</span> <span class="o">-</span> <span class="n">reference</span>
+</span><span id="line-37">        <span class="n">sequence_logratios</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">logratio</span><span class="p">[</span><span class="n">response_mask</span><span class="p">]</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span>
+</span><span id="line-38">
+</span><span id="line-39">        <span class="c1"># 平均回复 NLL 让长短回复在批次中权重相同。</span>
+</span><span id="line-40">        <span class="n">response_nlls</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="o">-</span><span class="n">logprobs</span><span class="p">[</span><span class="n">response_mask</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
+</span><span id="line-41">
+</span><span id="line-42">        <span class="c1"># 采样 token 上的对数比值平方，即该配方的轻量 KL 代理。</span>
+</span><span id="line-43">        <span class="n">kl_proxy_terms</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">logratio</span><span class="p">[</span><span class="n">response_mask</span><span class="p">]</span><span class="o">.</span><span class="n">square</span><span class="p">()</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
+</span><span id="line-44">
+</span><span id="line-45">    <span class="n">dpo_terms</span> <span class="o">=</span> <span class="p">[]</span>
+</span><span id="line-46">    <span class="k">for</span> <span class="n">pair_start</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">sequence_logratios</span><span class="p">),</span> <span class="mi">2</span><span class="p">):</span>
+</span><span id="line-47">        <span class="c1"># 偶数行是 chosen，紧随其后的奇数行是 rejected。</span>
+</span><span id="line-48">        <span class="n">chosen_logratio</span> <span class="o">=</span> <span class="n">sequence_logratios</span><span class="p">[</span><span class="n">pair_start</span><span class="p">]</span>
+</span><span id="line-49">        <span class="n">rejected_logratio</span> <span class="o">=</span> <span class="n">sequence_logratios</span><span class="p">[</span><span class="n">pair_start</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+</span><span id="line-50">        <span class="n">preference_margin</span> <span class="o">=</span> <span class="n">chosen_logratio</span> <span class="o">-</span> <span class="n">rejected_logratio</span>
+</span><span id="line-51">        <span class="n">dpo_terms</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="o">-</span><span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">BETA</span> <span class="o">*</span> <span class="n">preference_margin</span><span class="p">))</span>
+</span><span id="line-52">
+</span><span id="line-53">    <span class="c1"># 先对各对的损失取平均，再只在 chosen 行（0、2、4……）上加 NLL。</span>
+</span><span id="line-54">    <span class="n">dpo</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">dpo_terms</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</span><span id="line-55">    <span class="n">chosen_nll</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">response_nlls</span><span class="p">[::</span><span class="mi">2</span><span class="p">])</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</span><span id="line-56">    <span class="n">kl_proxy</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">kl_proxy_terms</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</span><span id="line-57">    <span class="n">loss</span> <span class="o">=</span> <span class="n">dpo</span> <span class="o">+</span> <span class="n">NLL_COEF</span> <span class="o">*</span> <span class="n">chosen_nll</span> <span class="o">+</span> <span class="n">KL_PROXY_COEF</span> <span class="o">*</span> <span class="n">kl_proxy</span>
+</span><span id="line-58">    <span class="k">return</span> <span class="n">loss</span><span class="p">,</span> <span class="p">{</span>
+</span><span id="line-59">        <span class="s2">"dpo:mean"</span><span class="p">:</span> <span class="n">dpo</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+</span><span id="line-60">        <span class="s2">"chosen_nll:mean"</span><span class="p">:</span> <span class="n">chosen_nll</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+</span><span id="line-61">        <span class="s2">"kl_proxy:mean"</span><span class="p">:</span> <span class="n">kl_proxy</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+</span><span id="line-62">        <span class="s2">"composite:mean"</span><span class="p">:</span> <span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span>
+</span><span id="line-63">    <span class="p">}</span>
+</span><span id="line-64">
+</span><span id="line-65">
+</span><span id="line-66"><span class="n">result</span> <span class="o">=</span> <span class="n">training_client</span><span class="o">.</span><span class="n">forward_backward_custom</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">dpo_composite_loss</span><span class="p">)</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+</span><span id="line-67"><span class="n">training_client</span><span class="o">.</span><span class="n">optim_step</span><span class="p">(</span><span class="n">types</span><span class="o">.</span><span class="n">AdamParams</span><span class="p">(</span><span class="n">learning_rate</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">))</span><span class="o">.</span><span class="n">result</span><span class="p">()</span>
+</span></code></pre></div>
+</div>
+<p>这里的参考模型就是训练客户端的初始状态。你也可以改用一个独立的参考模型来给数据打分。无论哪种方式，都要保证每一行参考值与对应的 datum 及目标 token 位置对齐。</p>
+</section>
+<hr class="docutils"/>
+<section id="id7">
+<h2>支持的输入<a class="headerlink" href="#id7" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id7'">¶</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">loss_type_input="logprobs"</span></code> 是目前唯一支持的输入类型（也是默认值）。每个 datum 的 <code class="docutils literal notranslate"><span class="pre">loss_fn_inputs</span></code> 只允许<strong>恰好</strong>包含：</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>键</p></th>
+<th class="head"><p>是否必需</p></th>
+<th class="head"><p>数据类型</p></th>
+<th class="head"><p>约束</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">target_tokens</span></code></p></td>
+<td><p>是</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int64</span></code></p></td>
+<td><p>长度与 <code class="docutils literal notranslate"><span class="pre">model_input</span></code> 相同</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">weights</span></code></p></td>
+<td><p>否</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">float32</span></code></p></td>
+<td><p>长度与 <code class="docutils literal notranslate"><span class="pre">target_tokens</span></code> 相同</p></td>
+</tr>
+</tbody>
+</table>
+<p>其余任何键（例如 <code class="docutils literal notranslate"><span class="pre">advantages</span></code>）都会在请求发出前被 SDK 拒绝。<code class="docutils literal notranslate"><span class="pre">weights</span></code> 有两个用途：你的回调可以读它（例如当作提示词掩码），服务器则用它计算第一遍的辅助损失指标。省略时，SDK 在第一遍发送全零；第二遍会换成由梯度导出的值。</p>
+<p>回调必须返回一个<strong>标量 torch 张量</strong>（对各对数概率张量可微）和一个 <strong><code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">float]</span></code></strong> 指标字典。指标名建议采用 <code class="docutils literal notranslate"><span class="pre">"name:sum"</span></code>、<code class="docutils literal notranslate"><span class="pre">"name:mean"</span></code> 这样的 Tinker 命名惯例。自定义指标只在完整的输入批次上计算一次，并在客户端合并；即使 TuFT 把请求拆成更小的服务器端批次，也不会再次聚合。</p>
+</section>
+<section id="id8">
+<h2>运行时开销<a class="headerlink" href="#id8" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id8'">¶</a></h2>
+<ul class="simple">
+<li><p><strong>多一次前向计算。</strong> 每次 <code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code> 需要<em>两次</em>前向加一次反向（内置损失只需一次前向加一次反向），外加一个网络来回：把对数概率发给客户端、再把权重发回来。实际耗时取决于模型、硬件、批次大小和网络延迟。</p></li>
+<li><p><strong>显存。</strong> 两个后端的第一遍都在 <code class="docutils literal notranslate"><span class="pre">torch.no_grad()</span></code> 下运行，PyTorch 不保存梯度计算图。峰值显存由反向传播决定，与内置损失相同。</p></li>
+<li><p><strong>传输量。</strong> 客户端为每个 token 发送一个 float32 权重。批次很大时，SDK 可能把数据拆成多个请求，但保持 datum 顺序不变。</p></li>
+<li><p><strong>FSDP 多卡。</strong> 两遍计算都会把批次切分到各个 rank，因此两个请求都必须满足 <code class="docutils literal notranslate"><span class="pre">len(data)</span> <span class="pre">&gt;=</span> <span class="pre">fsdp_num_gpus</span></code>——与 <code class="docutils literal notranslate"><span class="pre">forward_backward</span></code> 的约束相同。</p></li>
+</ul>
+</section>
+<section id="id9">
+<h2>错误处理<a class="headerlink" href="#id9" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id9'">¶</a></h2>
+<ul class="simple">
+<li><p><strong>未知的损失名到不了模型。</strong> <code class="docutils literal notranslate"><span class="pre">/forward_backward</span></code> 只接受五个内置名称，其余一律返回 <strong>422</strong>。<code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code> 的服务器端工作复用现有内置损失，因此不需要新增任何服务器端名称。</p></li>
+<li><p><strong>datum 输入格式错误</strong>会收到针对 <code class="docutils literal notranslate"><span class="pre">loss_fn_inputs</span></code> 的具体报错。不支持的键在第一遍之前就被 SDK 拒绝；键、形状、数据类型不匹配则由服务器校验。<code class="docutils literal notranslate"><span class="pre">target_tokens</span></code> 和 <code class="docutils literal notranslate"><span class="pre">weights</span></code> 的长度必须与模型输入一致。</p></li>
+<li><p><strong>回调异常留在客户端。</strong> 你的损失函数抛出异常（或某个 datum 带了不支持的键）时，错误出现在你自己的进程里。即使它发生在两遍之间也无碍：第一遍没有累积任何梯度，训练运行的梯度状态原封不动，直接重试即可。</p></li>
+</ul>
+</section>
+<section id="id10">
+<h2>自定义步骤有何不同<a class="headerlink" href="#id10" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id10'">¶</a></h2>
+<ul class="simple">
+<li><p><strong>第一遍只读模型。</strong> 不改权重，不积梯度。回调失败时训练运行不受影响，可直接重试。</p></li>
+<li><p><strong>第二遍与普通的 <code class="docutils literal notranslate"><span class="pre">forward_backward</span></code> 无异。</strong> 梯度持续累积到下一次 <code class="docutils literal notranslate"><span class="pre">optim_step</span></code>，因此可以在一次优化器更新之前叠加自定义梯度和内置梯度。</p></li>
+<li><p><strong>两遍之间不要更新模型。</strong> 客户端回调运行期间，其他线程不得调用 <code class="docutils literal notranslate"><span class="pre">optim_step</span></code>——否则返回的对数概率描述的是旧模型，反向传播用的却是新模型。串行使用是安全的：等自定义调用完成，再更新优化器。</p></li>
+<li><p><strong>自定义代码永远不在服务器上运行。</strong> 共享服务器始终只执行五个内置损失函数。</p></li>
+</ul>
+</section>
+<hr class="docutils"/>
+<section id="id11">
+<h2>常见问题<a class="headerlink" href="#id11" title="Link to this heading" x-intersect.margin.0%.0%.-70%.0%="activeSection = '#id11'">¶</a></h2>
+<p><strong>问：哪些 SDK 版本可用？</strong>
+<code class="docutils literal notranslate"><span class="pre">forward_backward_custom</span></code> 配合 <code class="docutils literal notranslate"><span class="pre">loss_type_input="logprobs"</span></code> 在 TuFT 锁定的 Tinker SDK 版本（0.25.x，见 <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code>）上验证通过。该机制只依赖稳定的 <code class="docutils literal notranslate"><span class="pre">forward</span></code> 与 <code class="docutils literal notranslate"><span class="pre">forward_backward</span></code> 请求。</p>
+<p><strong>问：能用对数概率以外的输入（比如完整 logits）吗？</strong>
+目前不行——SDK 只提供 <code class="docutils literal notranslate"><span class="pre">"logprobs"</span></code> 这一种 <code class="docutils literal notranslate"><span class="pre">loss_type_input</span></code>，TuFT 也只返回逐 token 的<em>目标</em>对数概率。需要全词表分布的损失（例如对教师的精确 KL）通常可以改写成针对采样目标的形式；这一模式参见<a class="reference internal" href="on-policy-distillation.html"><span class="std std-doc">在策略蒸馏指南</span></a>。</p>
+<p><strong>问：自定义指标会跨微批次聚合吗？</strong>
+即使服务器分小批处理，你的回调看到的也是完整的输入批次。指标只计算一次，由 SDK 合并进最终结果。</p>
+<p><strong>问：梯度看起来不对，怎么排查？</strong>
+与直接计算对照：把回调里的数学运算直接在模型的本地副本上跑一遍，比较其参数梯度与自定义调用的结果。想快速核对数值，可以对 <code class="docutils literal notranslate"><span class="pre">training_client.forward(...)</span></code> 返回的对数概率跑同一套运算。</p>
+</section>
+</section>
+</div></div><aside class="hidden text-sm xl:block" id="right-sidebar">
+<div class="sticky top-16 -mt-10 max-h-[calc(100vh-5rem)] h-full overflow-y-auto pt-6 space-y-2"><p class="font-medium">On this page</p>
+<ul>
+<li><a :data-current="activeSection === '#id2'" class="reference internal" href="#id2">您将学到</a></li>
+<li><a :data-current="activeSection === '#id3'" class="reference internal" href="#id3">目录</a></li>
+<li><a :data-current="activeSection === '#id4'" class="reference internal" href="#id4">何时使用自定义损失</a></li>
+<li><a :data-current="activeSection === '#id5'" class="reference internal" href="#id5">自定义损失的工作原理</a></li>
+<li><a :data-current="activeSection === '#id6'" class="reference internal" href="#id6">监督微调示例</a></li>
+<li><a :data-current="activeSection === '#dpo-nll'" class="reference internal" href="#dpo-nll">DPO + NLL 示例</a></li>
+<li><a :data-current="activeSection === '#id7'" class="reference internal" href="#id7">支持的输入</a></li>
+<li><a :data-current="activeSection === '#id8'" class="reference internal" href="#id8">运行时开销</a></li>
+<li><a :data-current="activeSection === '#id9'" class="reference internal" href="#id9">错误处理</a></li>
+<li><a :data-current="activeSection === '#id10'" class="reference internal" href="#id10">自定义步骤有何不同</a></li>
+<li><a :data-current="activeSection === '#id11'" class="reference internal" href="#id11">常见问题</a></li>
+</ul>
+</div>
+</aside>
+</main>
+</div>
+</div><footer class="py-6 border-t border-border md:py-0">
+<div class="container flex flex-col items-center justify-between gap-4 md:h-24 md:flex-row">
+<div class="flex flex-col items-center gap-4 px-8 md:flex-row md:gap-2 md:px-0">
+<p class="text-sm leading-loose text-center text-muted-foreground md:text-left"></p>
+</div>
+</div>
+</footer>
+</div>
+<script src="../_static/documentation_options.js?v=ad3000b3"></script>
+<script src="../_static/doctools.js?v=9bcbadda"></script>
+<script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+<script defer="defer" src="../_static/theme.js?v=5db23cf8"></script>
+<script src="../_static/translations.js?v=beaddf03"></script>
+<script src="../_static/design-tabs.js?v=f930bc37"></script>
+<script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+<script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<script src="../_static/custom.js?v=d0898e36"></script>
+</body>
+</html>
