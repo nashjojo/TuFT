@@ -677,3 +677,45 @@ async def test_forward_replicates_when_data_fewer_than_actors():
         assert len(args[0]) == 1  # full batch, not a shard
         assert args[6] is True  # replicated flag (7th positional)
     assert len(output.loss_fn_outputs) == 1
+
+
+def _full_param_backend():
+    from tuft.backends.fsdp_training_backend import FSDPTrainingBackend
+
+    config = ModelConfig(
+        model_name="test",
+        model_path=Path("/tmp/model"),
+        max_model_len=1024,
+        training_backend="fsdp",
+        fsdp_num_gpus=2,
+        training_mode="full_param",
+    )
+    backend = FSDPTrainingBackend(config)
+    backend._worker = None
+    return backend
+
+
+@pytest.mark.asyncio
+async def test_release_run_clears_the_hosted_full_param_run():
+    """release_run must clear the backend's own guard.
+
+    create_adapter refuses a second full-param run based on _full_run_id, and
+    the backend had no release_run at all, so a resumed client could never take
+    the slot.
+    """
+    backend = _full_param_backend()
+    backend._full_run_id = "old-run"
+
+    await backend.release_run("old-run")
+
+    assert backend._full_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_release_run_leaves_a_different_hosted_run_alone():
+    backend = _full_param_backend()
+    backend._full_run_id = "other-run"
+
+    await backend.release_run("old-run")
+
+    assert backend._full_run_id == "other-run"

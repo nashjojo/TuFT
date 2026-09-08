@@ -365,7 +365,7 @@ class TrainingController:
                     # release_run is FSDP-specific, not part of the base contract.
                     release = getattr(record.backend, "release_run", None)
                     if release is not None:
-                        release(record.training_run_id)
+                        await release(record.training_run_id)
                 record.backend = None
                 logger.info(
                     "Released full-param run %s so %s can take the single slot",

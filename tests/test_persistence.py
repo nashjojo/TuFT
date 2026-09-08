@@ -1249,7 +1249,7 @@ async def test_full_param_create_releases_the_previous_run(tmp_path, monkeypatch
     # real class as its spec.
     backend = MagicMock(spec=BaseTrainingBackend)
     backend.create_adapter = AsyncMock()
-    backend.release_run = MagicMock()
+    backend.release_run = AsyncMock()
     controller.training_backends[base_model] = backend
 
     old_record = TrainingRunRecord(

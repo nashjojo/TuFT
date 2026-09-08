@@ -1398,6 +1398,31 @@ class FSDPTrainingBackend(BaseTrainingBackend):
             raise ValueError(f"Unknown lora_id: {lora_id}; call create_adapter first.")
         return self._lora_id_to_adapter_name[lora_id]
 
+    async def release_run(self, run_id: str) -> None:
+        """Give up the single full-param slot so another run can take it.
+
+        Mirrors remove_adapter's full-param branch. A resumed client arrives
+        under a new session with a new run id, and create_adapter refuses a
+        second full-param run while this backend still hosts one.
+        """
+        async with self._lock:
+            if self._training_mode != "full_param" or self._full_run_id != run_id:
+                return
+            self._full_run_id = None
+            self._lora_id_to_adapter_name.pop(run_id, None)
+            self._adapter_name_to_lora_id.pop(run_id, None)
+            if isinstance(self._worker, FullParamFSDPWorker):
+                await asyncio.to_thread(self._worker.release_run, run_id)
+            elif self._actors:
+                import ray
+
+                await asyncio.gather(
+                    *[
+                        asyncio.to_thread(ray.get, a.release_run.remote(run_id))
+                        for a in self._actors
+                    ]
+                )
+
     async def create_adapter(self, lora_id: str, lora_config: types.LoraConfig) -> None:
         async with self._lock:
             if self._world_size == 0 and self._worker is None and not self._actors:
