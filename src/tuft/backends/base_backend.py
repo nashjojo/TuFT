@@ -52,6 +52,15 @@ class BaseSamplingBackend(BaseBackend):
     async def remove_adapter(self, lora_id: str) -> None:
         """Remove LoRA adapter from the backend."""
 
+    async def deploy_full_weights(self, weights_path: Path, deployment_id: str) -> None:  # noqa: B027
+        """Deploy full model weights when supported by the backend."""
+
+    def is_ready(self) -> bool:
+        return True
+
+    async def wait_ready(self) -> None:  # noqa: B027
+        """Wait until the backend can safely serve requests."""
+
     def get_openai_api_url(self) -> Optional[str]:
         """Return the vLLM OpenAI API base URL, or None if not available."""
         return None
@@ -127,6 +136,7 @@ class BaseTrainingBackend(BaseBackend):
         config: ModelConfig,
         fsdp_index: Optional[int] = None,
         worker_venv_path: Optional[str] = None,
+        training_mode: str = "lora",
     ) -> "BaseTrainingBackend":
         """Factory method to create a training backend instance.
 
@@ -143,6 +153,7 @@ class BaseTrainingBackend(BaseBackend):
         if training_backend == "fsdp":
             from ..backends.fsdp_training_backend import FSDPTrainingBackend
 
+            config.training_mode = training_mode
             return FSDPTrainingBackend(
                 config, fsdp_index=fsdp_index, worker_venv_path=worker_venv_path
             )

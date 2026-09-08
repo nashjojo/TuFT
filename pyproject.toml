@@ -104,6 +104,8 @@ quote-style = "double"
 
 [tool.pyright]
 pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
 typeCheckingMode = "standard"
 reportUnusedImport = false
 reportMissingImports = false

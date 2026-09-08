@@ -621,8 +621,15 @@ def test_shard_list_batch_order_contract_with_variable_length_data():
 
 
 @pytest.mark.asyncio
-async def test_forward_raises_when_data_fewer_than_actors():
-    """forward() raises ValueError when len(data) < world_size (NCCL deadlock guard)."""
+async def test_forward_replicates_when_data_fewer_than_actors():
+    """forward() dispatches small batches REPLICATED instead of raising.
+
+    The tinker SDK's byte-budget chunking can emit 1-3 datum remainder
+    sub-requests; sharding those across ranks idles actors and deadlocks
+    FSDP-2 collectives. Instead every actor must receive the identical full
+    batch with replicated=True (which skips the world_size loss
+    compensation in the engine).
+    """
     from unittest.mock import MagicMock
 
     from tuft.backends.fsdp_training_backend import FSDPTrainingBackend
@@ -638,6 +645,11 @@ async def test_forward_raises_when_data_fewer_than_actors():
     # Simulate multi-actor path: _worker is None, _actors has 2 stubs
     backend._worker = None
     backend._actors = [MagicMock(), MagicMock()]
+    for actor in backend._actors:
+        actor.forward_backward.remote.return_value = {
+            "metrics": {"loss:sum": 1.0},
+            "loss_fn_outputs": [{"logprobs": [0.1, 0.2, 0.3]}],
+        }
     backend._lora_id_to_adapter_name = {"lora1": "adapter_0"}
     backend._adapter_name_to_lora_id = {"adapter_0": "lora1"}
 
@@ -646,11 +658,22 @@ async def test_forward_raises_when_data_fewer_than_actors():
         loss_fn_inputs={},
     )
 
-    with pytest.raises(ValueError, match=r"len\(data\)=1, world_size=2"):
-        await backend.forward(
+    from unittest.mock import patch
+
+    with patch("ray.get", side_effect=lambda refs: list(refs)):
+        output = await backend.forward(
             data=[single_datum],
             lora_id="lora1",
             loss_fn="cross_entropy",
             loss_fn_config=None,
             backward=True,
         )
+
+    # Both actors received the identical full batch, replicated flag set,
+    # and outputs are NOT duplicated across actors.
+    for actor in backend._actors:
+        actor.forward_backward.remote.assert_called_once()
+        args = actor.forward_backward.remote.call_args[0]
+        assert len(args[0]) == 1  # full batch, not a shard
+        assert args[6] is True  # replicated flag (7th positional)
+    assert len(output.loss_fn_outputs) == 1

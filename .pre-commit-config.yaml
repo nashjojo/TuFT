@@ -14,7 +14,10 @@ repos:
           - fastapi
           - httpx
           - numpy
-          - tinker>=0.18.2
+          # Must match the pyproject pin: tinker >=0.25 dropped the
+          # _pydantic_types request mirrors the server still uses, so an
+          # unbounded install here makes pyright flag working code.
+          - tinker>=0.18.2,<0.25
           - typer
           - uvicorn
           - pytest

@@ -35,6 +35,7 @@ class CheckpointMetadata(BaseModel):
     owner_name: str
     size_bytes: int = 0
     lora_rank: int | None = None
+    training_mode: str = "lora"
     public: bool = False
     future_id: int = 0
     seq_id: int | None = None
@@ -55,6 +56,7 @@ class CheckpointRecord(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     future_id: int = 0
     seq_id: int | None = None
+    training_mode: str = "lora"
 
     @field_serializer("path")
     def serialize_path(self, path: Path) -> str:
@@ -102,6 +104,14 @@ class CheckpointRecord(BaseModel):
         return self.path / "adapter"
 
     @property
+    def training_state_path(self) -> Path:
+        return self.path / "training_state"
+
+    @property
+    def model_path(self) -> Path:
+        return self.path / "model"
+
+    @property
     def optimizer_path(self) -> Path:
         """Get the path to the optimizer state file."""
         return self.path / "optimizer"
@@ -120,9 +130,16 @@ class CheckpointRecord(BaseModel):
             base_model=metadata.base_model,
             session_id=metadata.session_id,
             lora_rank=metadata.lora_rank,
+            training_mode=metadata.training_mode,
         )
 
-    def save_metadata(self, base_model: str, session_id: str, lora_rank: int | None) -> None:
+    def save_metadata(
+        self,
+        base_model: str,
+        session_id: str,
+        lora_rank: int | None,
+        training_mode: str = "lora",
+    ) -> None:
         """Save the checkpoint metadata to disk."""
         # check the format of metadata
         try:
@@ -136,6 +153,7 @@ class CheckpointRecord(BaseModel):
                 tinker_path=self.tinker_path,
                 owner_name=self.owner_name,
                 lora_rank=lora_rank,
+                training_mode=training_mode,
                 public=self.public,
                 size_bytes=self.size_bytes,
                 future_id=self.future_id,
@@ -172,6 +190,7 @@ class CheckpointRecord(BaseModel):
         record.created_at = datetime.fromisoformat(metadata.created_at)
         record.future_id = metadata.future_id
         record.seq_id = metadata.seq_id
+        record.training_mode = metadata.training_mode
         return record
 
     def delete(self) -> None:

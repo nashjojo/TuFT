@@ -138,7 +138,12 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
         _instrument_fastapi(app)
 
     @app.get("/api/v1/healthz", response_model=types.HealthResponse)
-    async def healthz() -> types.HealthResponse:
+    async def healthz(state: ServerState = Depends(_get_state)) -> types.HealthResponse:
+        ready = all(backend.is_ready() for backend in state.sampling._base_backends.values())
+        if not ready:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="sampling backend not ready"
+            )
         return types.HealthResponse(status="ok")
 
     @app.get(
@@ -199,6 +204,7 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
                 detail=f"Failed to create sampling session: {exc.detail}",
             ) from exc
         except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("create_sampling_session failed")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to create sampling session: {str(exc)}",
@@ -219,6 +225,33 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Missing LoRA config"
             )
+        # Deterministic model_id from (session_id, model_seq_id) makes
+        # create_model idempotent: a client that recreates its training client
+        # after a crash/resume within the same session reuses the existing run
+        # and its FSDP slot instead of leaking a new one on every relaunch.
+        deterministic_model_id = f"{request.session_id}:train:{request.model_seq_id}"
+        existing = state.training.training_runs.get(deterministic_model_id)
+        if existing is not None:
+            requested_mode = (request.user_metadata or {}).get("training_mode", "lora")
+            if (
+                existing.model_owner != user.user_id
+                or existing.base_model != request.base_model
+                or existing.training_mode != requested_mode
+                or (requested_mode == "lora" and existing.lora_rank != request.lora_config.rank)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Model {deterministic_model_id} already exists with a different "
+                        "owner, base model, training mode, or rank."
+                    ),
+                )
+            response = types.CreateModelResponse(model_id=existing.training_run_id)
+            return await state.future_store.create_ready_future(
+                response,
+                model_id=existing.training_run_id,
+                user_id=user.user_id,
+            )
         try:
             training_record = await state.create_model(
                 session_id=request.session_id,
@@ -226,6 +259,7 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
                 lora_config=request.lora_config,
                 model_owner=user.user_id,
                 user_metadata=request.user_metadata,
+                model_id=deterministic_model_id,
             )
         except TuFTException as exc:
             raise HTTPException(

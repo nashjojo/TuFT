@@ -10,7 +10,7 @@ import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import torch
 from packaging import version
@@ -92,6 +92,30 @@ def _shard_list(xs: list[Any], n_shards: int) -> list[list[Any]]:
         shards.append(xs[start : start + size])
         start += size
     return shards
+
+
+def _uniform_micro_batch_size(shard_lens: list[int], max_mb: int) -> Optional[int]:
+    """Largest micro-batch size <= ``max_mb`` giving every rank the same count.
+
+    FSDP2 issues one collective set per micro-batch, so ranks that iterate a
+    different number of times deadlock. Requiring ``max_mb`` to divide every
+    shard exactly is too strict: it fails on the common uneven-shard case and
+    forces a single micro-batch holding the whole shard, which is what OOMs the
+    GPU. The engine slices with ``range(0, len(data), mb)``, so an uneven final
+    chunk is fine as long as the resulting count matches across ranks.
+
+    Returns ``None`` when no split yields both equal counts and more than one
+    micro-batch; callers then fall back to one micro-batch per rank, which is
+    safe because it only happens for shards too small to matter.
+    """
+    lens = [n for n in shard_lens if n > 0]
+    if not lens or max_mb <= 0:
+        return None
+    for mb in range(min(max_mb, max(lens)), 0, -1):
+        counts = {(n + mb - 1) // mb for n in lens}
+        if len(counts) == 1 and next(iter(counts)) > 1:
+            return mb
+    return None
 
 
 def _merge_metrics(
@@ -235,15 +259,18 @@ def _config_to_worker_dict(config: ModelConfig) -> dict:
         "max_model_len": config.max_model_len,
         "fsdp_override_config": dict(getattr(config, "fsdp_override_config", None) or {}),
         "attn_implementation": getattr(config, "attn_implementation", None),
+        "training_mode": getattr(config, "training_mode", "lora"),
         "slot_config": {
             "rank_slots": rank_slots,
             "lora_alpha_ratio": 2,
-            "target_modules": ["q_proj", "v_proj"],
+            "target_modules": list(
+                getattr(config, "lora_target_modules", None) or ["q_proj", "v_proj"]
+            ),
         },
     }
 
 
-def _worker_dict_to_configs(config_dict: dict) -> tuple[FSDPModelConfig, SlotPoolConfig]:
+def _worker_dict_to_configs(config_dict: dict) -> tuple[FSDPModelConfig, SlotPoolConfig, str]:
     """Build the torch-native model and slot configurations inside an actor."""
 
     override = dict(config_dict.get("fsdp_override_config") or {})
@@ -268,14 +295,47 @@ def _worker_dict_to_configs(config_dict: dict) -> tuple[FSDPModelConfig, SlotPoo
         lora_alpha_ratio=int(sc.get("lora_alpha_ratio", 2)),
         target_modules=list(sc.get("target_modules", ["q_proj", "v_proj"])),
     )
-    return model_config, slot_config
+    training_mode = str(config_dict.get("training_mode", "lora"))
+    return model_config, slot_config, training_mode
 
 
 # =============================================================================
-# MultiAdapterFSDPWorker
+# FSDP workers
 # =============================================================================
-# Owns the sharded PEFT module, adapter slots, per-adapter optimizers, and checkpoints.
-# =============================================================================
+
+
+def _fully_shard_model(model: Any) -> Any:
+    # fp32 shards are the master weights AdamW updates; MixedPrecisionPolicy
+    # below casts them to bf16 for compute, so precision is kept without
+    # slowing the forward/backward.
+    model = model.to(torch.float32).cuda()
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        cast_forward_inputs=True,
+    )
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    device_mesh = init_device_mesh("cuda", (world_size,)) if world_size > 1 else None
+    transformer_layer_cls_names = getattr(model, "_no_split_modules", None) or [
+        "DecoderLayer",
+        "TransformerBlock",
+        "LlamaDecoderLayer",
+        "Qwen2DecoderLayer",
+        "Qwen3DecoderLayer",
+    ]
+    wrapped_modules = [
+        module
+        for module in model.modules()
+        if module.__class__.__name__ in transformer_layer_cls_names
+    ]
+    for module in wrapped_modules:
+        fully_shard(module, mesh=device_mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=device_mesh, mp_policy=mp_policy)
+    return model
 
 
 class MultiAdapterFSDPWorker:
@@ -309,7 +369,6 @@ class MultiAdapterFSDPWorker:
         if self._initialized:
             return
         base_model = build_base_model(self.model_config)
-
         peft_model = None
         for rank, count in self.slot_config.rank_slots.items():
             lora_alpha = self.slot_config.get_lora_alpha(rank)
@@ -343,36 +402,7 @@ class MultiAdapterFSDPWorker:
 
         first = next(iter(self._adapters))
         peft_model.set_adapter(first)
-        model_bf16 = peft_model.to(torch.bfloat16)
-        model_cuda = model_bf16.cuda()
-
-        # FSDP v2: fully_shard (same as fsdp_standalone_reference.py)
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            cast_forward_inputs=True,
-        )
-        import torch.distributed as dist
-        from torch.distributed.device_mesh import init_device_mesh
-
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        device_mesh = init_device_mesh("cuda", (world_size,)) if world_size > 1 else None
-
-        transformer_layer_cls_names = getattr(model_cuda, "_no_split_modules", None) or [
-            "DecoderLayer",
-            "TransformerBlock",
-            "LlamaDecoderLayer",
-            "Qwen2DecoderLayer",
-            "Qwen3DecoderLayer",
-        ]
-        wrapped_modules = []
-        for _name, module in model_cuda.named_modules():
-            if module.__class__.__name__ in transformer_layer_cls_names:
-                wrapped_modules.append(module)
-        for module in wrapped_modules:
-            fully_shard(module, mesh=device_mesh, mp_policy=mp_policy)
-        fully_shard(model_cuda, mesh=device_mesh, mp_policy=mp_policy)
-        self.module = model_cuda
+        self.module = _fully_shard_model(peft_model)
         self._create_optimizer_for_adapter(first)
         self._initialized = True
 
@@ -443,6 +473,7 @@ class MultiAdapterFSDPWorker:
         loss_fn_config: dict[str, float] | None,
         micro_batch_size: int,
         forward_only: bool = False,
+        replicated: bool = False,
     ) -> Dict[str, Any]:
         """Run forward/backward without stepping or clearing accumulated gradients.
 
@@ -472,6 +503,7 @@ class MultiAdapterFSDPWorker:
             loss_fn_config,
             micro_batch_size,
             forward_only=forward_only,
+            replicated=replicated,
         )
 
     def optim_step(
@@ -628,6 +660,7 @@ class MultiAdapterFSDPWorker:
 
     def load_checkpoint(self, adapter_name: str, path: str | Path, optimizer: bool = True) -> None:
         path = Path(path)
+
         state = torch.load(path / "adapter.pt", map_location="cpu", weights_only=True)
         # Build a slot-name-independent lookup: canonicalize saved keys so a checkpoint
         # saved under ANY slot name loads into the current slot. Without this, a slot
@@ -692,6 +725,301 @@ class MultiAdapterFSDPWorker:
         return list(self._adapters.keys())
 
 
+class FullParamFSDPWorker:
+    """One exclusive full-parameter training model, optimizer, and checkpoint."""
+
+    FULL_RUN_ID = "__full_param__"
+
+    def __init__(self, model_config: FSDPModelConfig) -> None:
+        self.model_config = model_config
+        self.module: Any = None
+        self.optimizer: torch.optim.Optimizer | None = None
+        self.step_count = 0
+        self.bound_run_id: str | None = None
+        self._initialized = False
+        self.logger = logging.getLogger(f"{__name__}.FullParamFSDPWorker")
+
+    def initialize(self) -> None:
+        if self._initialized:
+            return
+
+        model = build_base_model(self.model_config)
+        for param in model.parameters():
+            param.requires_grad = True
+        self.module = _fully_shard_model(model)
+        self.optimizer = torch.optim.AdamW(
+            [p for p in self.module.parameters() if p.requires_grad],
+            lr=1e-4,
+            weight_decay=0.01,
+        )
+        self._initialized = True
+        self.logger.info("[FSDP] full-param worker initialized")
+
+    def bind_run(self, run_id: str) -> None:
+        if self.bound_run_id is None:
+            self.bound_run_id = run_id
+            return
+        if self.bound_run_id != run_id:
+            raise RuntimeError(
+                f"Full-param worker is already bound to {self.bound_run_id}; "
+                f"refusing to share it with {run_id}."
+            )
+
+    def release_run(self, run_id: str) -> None:
+        if self.bound_run_id != run_id:
+            raise RuntimeError(f"Full-param worker is bound to {self.bound_run_id}, not {run_id}.")
+        self.optimizer = None
+        self.step_count = 0
+        self.bound_run_id = None
+
+    def _require_run(self, run_id: str) -> None:
+        if self.bound_run_id != run_id:
+            raise RuntimeError(
+                f"Full-param worker is not bound to run {run_id}; "
+                f"call create_adapter before forward/optim/checkpoint operations."
+            )
+
+    def forward_backward(
+        self,
+        run_id: str,
+        data: list[types.Datum],
+        loss_fn_name: str,
+        loss_fn_config: dict[str, float] | None,
+        micro_batch_size: int,
+        forward_only: bool = False,
+        replicated: bool = False,
+    ) -> Dict[str, Any]:
+        self._require_run(run_id)
+        if self.optimizer is None:
+            self._create_optimizer()
+        self.module.train()
+        return fsdp_forward_backward(
+            self.module,
+            data,
+            loss_fn_name,
+            loss_fn_config,
+            micro_batch_size,
+            forward_only=forward_only,
+            replicated=replicated,
+        )
+
+    def optim_step(
+        self,
+        run_id: str,
+        learning_rate: Optional[float] = None,
+        weight_decay: Optional[float] = None,
+        grad_clip_norm: Optional[float] = None,
+        betas: Optional[tuple[float, float]] = None,
+        eps: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        self._require_run(run_id)
+        if self.optimizer is None:
+            self._create_optimizer()
+        opt = self.optimizer
+        if learning_rate is not None:
+            for pg in opt.param_groups:
+                pg["lr"] = learning_rate
+        if weight_decay is not None:
+            for pg in opt.param_groups:
+                pg["weight_decay"] = weight_decay
+        if betas is not None:
+            for pg in opt.param_groups:
+                pg["betas"] = tuple(betas)
+        if eps is not None:
+            for pg in opt.param_groups:
+                pg["eps"] = eps
+        # Must run before clipping and zero_grad, both of which destroy the
+        # pre-clip gradients that the cross-validation needs.
+        diag = self.grad_diagnostics()
+        self.logger.info(
+            "[grad] preclip_norm=%.6f num_params_with_grad=%d probes=%s",
+            diag.get("grad_norm_preclip", 0.0),
+            int(diag.get("num_params_with_grad", 0)),
+            {
+                k.split("/", 1)[1]: round(v, 6)
+                for k, v in diag.items()
+                if k.startswith("grad_norm_probe/")
+            },
+        )
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            params = [p for pg in opt.param_groups for p in pg["params"]]
+            torch.nn.utils.clip_grad_norm_(params, grad_clip_norm)
+        opt.step()
+        opt.zero_grad()
+        self.step_count += 1
+        return {"step_count": self.step_count, "run_id": run_id, **diag}
+
+    def grad_diagnostics(self) -> dict:
+        """Pre-clip gradient norms, for cross-validating the backward pass.
+
+        Squared norms are additive across FSDP2 shards, so each rank sums its
+        local contribution and one scalar all-reduce recovers the global value.
+        Gathering every gradient with ``full_tensor()`` instead would
+        materialize each parameter unsharded (``embed_tokens`` alone is 1.2 GiB
+        in fp32) and issue one collective per parameter on every optimizer step.
+        """
+        probe_names = (
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.27.self_attn.o_proj.weight",
+        )
+        named = dict(self.module.named_parameters())
+
+        local_total = 0.0
+        count = 0
+        device = None
+        for p in self.module.parameters():
+            if not p.requires_grad or p.grad is None:
+                continue
+            g = p.grad.detach()
+            device = g.device
+            local_total += float(g.float().pow(2).sum())
+            count += 1
+
+        local_probes = []
+        for name in probe_names:
+            p = named.get(name)
+            if p is not None and p.grad is not None:
+                local_probes.append(float(p.grad.detach().float().pow(2).sum()))
+            else:
+                local_probes.append(0.0)
+
+        values = [local_total, *local_probes]
+        if device is not None:
+            import torch.distributed as dist
+
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                buf = torch.tensor(values, device=device, dtype=torch.float64)
+                dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+                values = buf.tolist()
+
+        out = {"grad_norm_preclip": values[0] ** 0.5, "num_params_with_grad": float(count)}
+        for name, sq in zip(probe_names, values[1:], strict=True):
+            out[f"grad_norm_probe/{name}"] = sq**0.5
+        return out
+
+    def _create_optimizer(self) -> None:
+        self.optimizer = torch.optim.AdamW(
+            [p for p in self.module.parameters() if p.requires_grad],
+            lr=1e-4,
+            weight_decay=0.01,
+        )
+
+    def _ensure_optimizer(self) -> torch.optim.Optimizer:
+        if self.optimizer is None:
+            self._create_optimizer()
+        if self.optimizer is None:
+            raise RuntimeError("optimizer could not be created for full-param worker")
+        return self.optimizer
+
+    def save_checkpoint(self, run_id: str, path: Path, optimizer: bool = True) -> None:
+        self._require_run(run_id)
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_state_dict,
+        )
+
+        opt = self._ensure_optimizer()
+
+        model_state, optim_state = get_state_dict(
+            self.module,
+            opt,
+            options=StateDictOptions(strict=True, flatten_optimizer_state_dict=False),
+        )
+        state: Dict[str, Any] = {
+            "model": model_state,
+            "step_count": torch.tensor(self.step_count, dtype=torch.long),
+        }
+        if optimizer:
+            state["optimizer"] = optim_state
+        dcp.save(state, checkpoint_id=str(path))
+
+    def load_checkpoint(self, run_id: str, path: Path, optimizer: bool = True) -> None:
+        self._require_run(run_id)
+        path = Path(path)
+        if not (path / ".metadata").exists():
+            raise FileNotFoundError(f"{path} is not a complete full-parameter training checkpoint.")
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_state_dict,
+            set_state_dict,
+        )
+
+        opt = self._ensure_optimizer()
+
+        model_state, optim_state = get_state_dict(
+            self.module,
+            opt,
+            options=StateDictOptions(strict=True, flatten_optimizer_state_dict=False),
+        )
+        state: Dict[str, Any] = {
+            "model": model_state,
+            "step_count": torch.tensor(self.step_count, dtype=torch.long),
+        }
+        if optimizer:
+            state["optimizer"] = optim_state
+        dcp.load(state, checkpoint_id=str(path))
+
+        if not optimizer:
+            optim_state = {}
+        set_state_dict(
+            self.module,
+            opt,
+            model_state_dict=state["model"],
+            optim_state_dict=state["optimizer"],
+            options=StateDictOptions(strict=True, flatten_optimizer_state_dict=False),
+        )
+        self.step_count = int(state["step_count"].item())
+
+    def save_sampler_checkpoint(self, run_id: str, path: Path) -> None:
+        self._require_run(run_id)
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        import torch.distributed as dist
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_model_state_dict,
+        )
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+        full_state = get_model_state_dict(
+            self.module,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True, strict=True),
+        )
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            config = AutoConfig.from_pretrained(self.model_config.path)
+            export_model = AutoModelForCausalLM.from_pretrained(
+                self.model_config.path,
+                config=config,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True,
+            )
+            # Master weights are fp32; vLLM loads bf16, so cast down before
+            # writing or the exported directory doubles in size.
+            export_state = {
+                k: v.to(torch.bfloat16)
+                for k, v in full_state.items()
+                if isinstance(v, torch.Tensor)
+            }
+            missing, unexpected = export_model.load_state_dict(export_state, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"Full sampler export mismatch: missing={missing}, unexpected={unexpected}"
+                )
+            export_model.save_pretrained(path, state_dict=export_state, safe_serialization=True)
+            # vLLM serves this directory standalone, so it needs the tokenizer
+            # (including the think tokens its reasoning parser looks up).
+            AutoTokenizer.from_pretrained(self.model_config.path).save_pretrained(path)
+
+
 # =============================================================================
 # FSDPWorkerActor: Ray actor, one GPU per process, forms torch.distributed with peers
 # =============================================================================
@@ -704,7 +1032,7 @@ class FSDPWorkerActor:
         self.rank = rank
         self.world_size = world_size
         self.config_dict = config_dict
-        self._worker: Optional[MultiAdapterFSDPWorker] = None
+        self._worker: Optional[MultiAdapterFSDPWorker | FullParamFSDPWorker] = None
         self._dist_initialized = False
         self.logger = logging.getLogger(f"{__name__}.FSDPWorkerActor")
 
@@ -742,26 +1070,51 @@ class FSDPWorkerActor:
     def build_worker(self) -> None:
         if self._worker is not None:
             return
-        model_config, slot_config = _worker_dict_to_configs(self.config_dict)
-        self._worker = MultiAdapterFSDPWorker(
-            model_config=model_config,
-            slot_config=slot_config,
-        )
+        model_config, slot_config, training_mode = _worker_dict_to_configs(self.config_dict)
+        if training_mode == "full_param":
+            self._worker = FullParamFSDPWorker(model_config=model_config)
+        else:
+            self._worker = MultiAdapterFSDPWorker(
+                model_config=model_config,
+                slot_config=slot_config,
+            )
         logging.info("[SERVER][Actor] build_worker 调用 initialize 前 rank=%s", self.rank)
         self._worker.initialize()
         logging.info("[SERVER][Actor] build_worker initialize 返回 rank=%s", self.rank)
 
+    def bind_run(self, run_id: str) -> None:
+        if isinstance(self._worker, FullParamFSDPWorker):
+            self._worker.bind_run(run_id)
+
+    def release_run(self, run_id: str) -> None:
+        if isinstance(self._worker, FullParamFSDPWorker):
+            self._worker.release_run(run_id)
+
+    def save_sampler_checkpoint(self, run_id: str, path: str) -> None:
+        if isinstance(self._worker, FullParamFSDPWorker):
+            self._worker.save_sampler_checkpoint(run_id, Path(path))
+
+    def shutdown(self) -> None:
+        import torch.distributed as dist
+
+        self._worker = None
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        self._dist_initialized = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def allocate_slot(self, rank: int) -> Optional[str]:
-        if self._worker is None:
-            return None
-        return self._worker.allocate_slot(rank)
+        if isinstance(self._worker, MultiAdapterFSDPWorker):
+            return self._worker.allocate_slot(rank)
+        return None
 
     def reserve_slot(self, adapter_name: str) -> None:
-        if self._worker is not None:
+        if isinstance(self._worker, MultiAdapterFSDPWorker):
             self._worker.reserve_slot(adapter_name)
 
     def release_slot(self, adapter_name: str) -> None:
-        if self._worker is not None:
+        if isinstance(self._worker, MultiAdapterFSDPWorker):
             self._worker.release_slot(adapter_name)
 
     def forward_backward(
@@ -772,6 +1125,7 @@ class FSDPWorkerActor:
         loss_fn_config: Optional[dict] = None,
         forward_only: bool = False,
         micro_batch_size: Optional[int] = None,
+        replicated: bool = False,
     ) -> Dict[str, Any]:
         """Run forward (+backward) on this actor's data shard.
 
@@ -781,6 +1135,9 @@ class FSDPWorkerActor:
         and accumulates gradients without stepping or clearing them. The caller
         guarantees every rank runs the same number of micro-batches so FSDP2
         collectives remain symmetric.
+
+        replicated: every rank received the identical full batch (small-batch
+        fallback); skips the world_size loss compensation in the engine.
 
         Caller is responsible for invoking `optim_step` afterwards
         (which will step + zero_grad).
@@ -794,13 +1151,12 @@ class FSDPWorkerActor:
                 "loss_fn_outputs": [],
             }
 
-        # Keep a single micro-batch when the configured size does not divide
-        # the shard. The backend applies the same fallback on every rank.
-        if micro_batch_size and micro_batch_size > 0 and len(data) % micro_batch_size == 0:
-            mb = micro_batch_size
-        else:
-            mb = len(data)
-        n_micro = len(data) // mb
+        # Cross-rank micro-batch count symmetry is decided by the backend, which
+        # sees every shard length and picks a size that yields the same count on
+        # all ranks. Honour it as given: falling back to the whole shard here is
+        # what puts a large batch into one micro-batch and OOMs the GPU.
+        mb = micro_batch_size if micro_batch_size and micro_batch_size > 0 else len(data)
+        n_micro = (len(data) + mb - 1) // mb
         out = self._worker.forward_backward(
             adapter_name,
             data,
@@ -808,6 +1164,7 @@ class FSDPWorkerActor:
             loss_fn_config,
             mb,
             forward_only=forward_only,
+            replicated=replicated,
         )
         metrics = dict(out.get("metrics") or {})
         metrics["actor/num_micro_batches"] = float(n_micro)
@@ -833,9 +1190,21 @@ class FSDPWorkerActor:
             adapter_name, learning_rate, weight_decay, grad_clip_norm, betas, eps
         )
 
-    def save_checkpoint(self, adapter_name: str, path: str, optimizer: bool = True) -> None:
-        # FSDP v2: all ranks must participate in full_tensor() collective operation
+    def save_checkpoint(
+        self,
+        adapter_name: str,
+        path: str,
+        optimizer: bool = True,
+        sampler: bool = False,
+    ) -> None:
+        # FSDP v2: all ranks must participate in collective checkpoint operations.
         if self._worker is None:
+            return
+        if isinstance(self._worker, FullParamFSDPWorker):
+            if sampler:
+                self._worker.save_sampler_checkpoint(adapter_name, Path(path))
+            else:
+                self._worker.save_checkpoint(adapter_name, Path(path), optimizer)
             return
         self._worker.save_checkpoint(adapter_name, Path(path), optimizer)
 
@@ -867,9 +1236,11 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         super().__init__(config)
         self._fsdp_index = fsdp_index  # Index among FSDP models; port = base + fsdp_index
         self._worker_venv_path = worker_venv_path
-        self._worker: Optional[MultiAdapterFSDPWorker] = None
+        self._training_mode = getattr(config, "training_mode", "lora")
+        self._worker: Optional[MultiAdapterFSDPWorker | FullParamFSDPWorker] = None
         self._actors: List[Any] = []
         self._world_size: int = 0
+        self._full_run_id: Optional[str] = None
         self._lora_id_to_adapter_name: Dict[str, str] = {}
         self._adapter_name_to_lora_id: Dict[str, str] = {}
         self._lock = asyncio.Lock()
@@ -886,12 +1257,17 @@ class FSDPTrainingBackend(BaseTrainingBackend):
 
         for actor in self._actors:
             try:
+                await asyncio.to_thread(ray.get, actor.shutdown.remote(), timeout=10)
+            except Exception:
+                pass
+            try:
                 ray.kill(actor, no_restart=True)
             except Exception:
                 pass
         self._actors = []
         self._worker = None
         self._world_size = 0
+        self._full_run_id = None
         self._lora_id_to_adapter_name.clear()
         self._adapter_name_to_lora_id.clear()
 
@@ -925,10 +1301,11 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                     rank=0,
                     world_size=1,
                 )
-            model_config, _slot = _worker_dict_to_configs(self._config_dict)
-            self._worker = MultiAdapterFSDPWorker(
-                model_config=model_config,
-                slot_config=self._slot_config,
+            model_config, slot_config, training_mode = _worker_dict_to_configs(self._config_dict)
+            self._worker = (
+                FullParamFSDPWorker(model_config=model_config)
+                if training_mode == "full_param"
+                else MultiAdapterFSDPWorker(model_config=model_config, slot_config=slot_config)
             )
             await asyncio.to_thread(self._worker.initialize)
             self._world_size = 1
@@ -937,67 +1314,80 @@ class FSDPTrainingBackend(BaseTrainingBackend):
 
         config_dict = self._config_dict
         _venv = self._worker_venv_path
+        base_env_vars: Dict[str, str] = {}
         if not _venv or not _venv.strip():
             self.logger.warning(
                 "worker_venv_path is not set. Recommend using a virtual environment for Ray FSDP; "
                 "set worker_venv_path in config if all nodes use the same venv. "
                 "Proceeding with empty runtime_env (relying on node-installed packages)."
             )
-            _runtime_env = {}
+            venv_python = None
         else:
             _path = os.environ.get("PATH", "")
-            # Ray uses py_executable so worker uses venv Python; else node Ray may not find tuft
-            _venv_python = str(Path(_venv) / "bin" / "python")
-            _runtime_env = {
-                "py_executable": _venv_python,
-                "env_vars": {
-                    "VIRTUAL_ENV": _venv,
-                    "PATH": f"{_venv}/bin:{_path}",
-                },
+            venv_python = str(Path(_venv) / "bin" / "python")
+            base_env_vars = {
+                "VIRTUAL_ENV": _venv,
+                "PATH": f"{_venv}/bin:{_path}",
             }
 
-        actors = []
-        for r in range(n_gpus):
-            actor = (
-                ray.remote(FSDPWorkerActor)
-                .options(
-                    num_gpus=1,
-                    runtime_env=_runtime_env,
+        _fsdp_gpu_list = [
+            g.strip() for g in os.environ.get("TUFT_FSDP_GPUS", "").split(",") if g.strip()
+        ]
+        if _fsdp_gpu_list:
+            if len(set(_fsdp_gpu_list)) != len(_fsdp_gpu_list):
+                raise ValueError(f"TUFT_FSDP_GPUS contains duplicates: {_fsdp_gpu_list}")
+            if len(_fsdp_gpu_list) != n_gpus:
+                raise ValueError(
+                    f"TUFT_FSDP_GPUS has {len(_fsdp_gpu_list)} GPUs but fsdp_num_gpus={n_gpus}"
                 )
-                .remote(r, n_gpus, config_dict)
-            )
-            actors.append(actor)
-        # Set _world_size / _actors only after all succeed; else next create_adapter retries init
-        # get_node_ip should return quickly; timeout avoids hang when actor not scheduled (e.g. GPU)
-        _GET_NODE_IP_TIMEOUT = 120
-        self.logger.info("[FSDP] async_init: created %d actors, calling get_node_ip...", n_gpus)
+
+        actors = []
         try:
+            for r in range(n_gpus):
+                actor_env = dict(base_env_vars)
+                if _fsdp_gpu_list:
+                    actor_env["CUDA_VISIBLE_DEVICES"] = _fsdp_gpu_list[r]
+                actor_runtime_env: Dict[str, Any] = {"env_vars": actor_env}
+                if venv_python:
+                    actor_runtime_env["py_executable"] = venv_python
+                actor = (
+                    ray.remote(FSDPWorkerActor)
+                    .options(
+                        num_gpus=0 if _fsdp_gpu_list else 1,
+                        runtime_env=actor_runtime_env,
+                    )
+                    .remote(r, n_gpus, config_dict)
+                )
+                actors.append(actor)
+            # Publish actor state only once all actors exist, so a failure leaves
+            # nothing half-initialized that the next create_adapter would reuse.
+            # get_node_ip hangs forever when an actor never schedules (e.g. no GPU).
+            _GET_NODE_IP_TIMEOUT = 120
+            self.logger.info("[FSDP] async_init: created %d actors, calling get_node_ip...", n_gpus)
             master_addr = await asyncio.to_thread(
                 ray.get, actors[0].get_node_ip.remote(), timeout=_GET_NODE_IP_TIMEOUT
             )
-        except Exception as e:
-            self.logger.error("[FSDP] get_node_ip FAILED: %s", e)
-            raise
-        self.logger.info("[FSDP] get_node_ip OK: %s, calling init_dist...", master_addr)
-        base_port = getattr(self.config, "fsdp_master_port", DEFAULT_MASTER_PORT)
-        master_port = base_port + self._fsdp_index if self._fsdp_index is not None else base_port
-        try:
+            self.logger.info("[FSDP] get_node_ip OK: %s, calling init_dist...", master_addr)
+            base_port = getattr(self.config, "fsdp_master_port", DEFAULT_MASTER_PORT)
+            master_port = (
+                base_port + self._fsdp_index if self._fsdp_index is not None else base_port
+            )
             await asyncio.gather(
                 *[
                     asyncio.to_thread(ray.get, a.init_dist.remote(master_addr, master_port))
                     for a in actors
                 ]
             )
-        except Exception as e:
-            self.logger.error("[FSDP] init_dist FAILED: %s", e)
-            raise
-        self.logger.info("[FSDP] init_dist OK, calling build_worker...")
-        try:
+            self.logger.info("[FSDP] init_dist OK, calling build_worker...")
             await asyncio.gather(
                 *[asyncio.to_thread(ray.get, a.build_worker.remote()) for a in actors]
             )
-        except Exception as e:
-            self.logger.error("[FSDP] build_worker FAILED: %s", e)
+        except Exception:
+            for actor in actors:
+                try:
+                    ray.kill(actor, no_restart=True)
+                except Exception:
+                    pass
             raise
         self.logger.info("[FSDP] build_worker OK, FSDP backend ready")
         self._actors = actors
@@ -1012,8 +1402,32 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         async with self._lock:
             if self._world_size == 0 and self._worker is None and not self._actors:
                 await self.async_init()
+
+            if self._training_mode == "full_param":
+                if self._full_run_id is None:
+                    self._full_run_id = lora_id
+                elif self._full_run_id != lora_id:
+                    raise ValueError(
+                        f"Full-param backend already hosts {self._full_run_id}; "
+                        f"refusing to create a second full-param run {lora_id}."
+                    )
+                if isinstance(self._worker, FullParamFSDPWorker):
+                    await asyncio.to_thread(self._worker.bind_run, lora_id)
+                elif self._actors:
+                    import ray
+
+                    await asyncio.gather(
+                        *[
+                            asyncio.to_thread(ray.get, a.bind_run.remote(lora_id))
+                            for a in self._actors
+                        ]
+                    )
+                self._lora_id_to_adapter_name[lora_id] = lora_id
+                self._adapter_name_to_lora_id[lora_id] = lora_id
+                return
+
             rank = getattr(lora_config, "rank", 8)
-            if self._worker is not None:
+            if isinstance(self._worker, MultiAdapterFSDPWorker):
                 adapter_name = await asyncio.to_thread(self._worker.allocate_slot, rank)
             elif self._actors:
                 import ray
@@ -1042,7 +1456,21 @@ class FSDPTrainingBackend(BaseTrainingBackend):
             adapter_name = self._lora_id_to_adapter_name.pop(lora_id, None)
             if adapter_name:
                 self._adapter_name_to_lora_id.pop(adapter_name, None)
-                if self._worker is not None:
+                if self._training_mode == "full_param":
+                    self._full_run_id = None
+                    if isinstance(self._worker, FullParamFSDPWorker):
+                        await asyncio.to_thread(self._worker.release_run, lora_id)
+                    elif self._actors:
+                        import ray
+
+                        await asyncio.gather(
+                            *[
+                                asyncio.to_thread(ray.get, a.release_run.remote(lora_id))
+                                for a in self._actors
+                            ]
+                        )
+                    return
+                if isinstance(self._worker, MultiAdapterFSDPWorker):
                     await asyncio.to_thread(self._worker.release_slot, adapter_name)
                 elif self._actors:
                     import ray
@@ -1055,6 +1483,26 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                             for a in self._actors
                         ]
                     )
+
+    def _apply_token_budget(self, mb: int, data: list[types.Datum]) -> int:
+        """Cap the per-call micro-batch size by a token budget.
+
+        The cap uses the batch's longest datum so every rank derives the same
+        effective mb from the same data (NCCL micro-batch symmetry holds). A
+        single datum longer than the budget keeps mb=1 — the caller is inside
+        the max_model_len envelope, which the engine has verified fits.
+        """
+        budget = getattr(self.config, "micro_batch_tokens", None)
+        if not budget or budget <= 0 or mb <= 1 or not data:
+            return mb
+        max_len = max(d.model_input.length for d in data)
+        capped = budget // max(max_len, 1)
+        if capped < 1:
+            return 1
+        # Round down to a power of two so the per-micro-batch token count stays
+        # predictable across calls rather than tracking each batch's longest
+        # datum exactly.
+        return min(mb, 1 << min(mb, capped).bit_length() - 1)
 
     async def forward(
         self,
@@ -1085,6 +1533,7 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         # 1 optim_step instead of N (forward_backward + optim_step) loops --
         # eliminating mini-batch SGD intra-step off-policy drift in PPO/GRPO.
         mb = int(getattr(self.config, "micro_batch_size", 0) or 0)
+        mb = self._apply_token_budget(mb, data)
 
         if self._worker is not None:
             # NO_RAY single-process mode: serialize GPU work across runs. Ray mode is
@@ -1097,7 +1546,7 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                     eff_mb = max(len(data), 1)
                 n_micro = max(len(data) // eff_mb, 1) if data else 0
                 out = await asyncio.to_thread(
-                    self._worker.forward_backward,
+                    cast(Any, self._worker).forward_backward,
                     adapter_name,
                     data,
                     loss_fn_name,
@@ -1119,39 +1568,46 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                     metrics={},
                 )
 
-            # NCCL deadlock guard: each actor must receive at least one datum,
-            # otherwise idle actors block forever on FSDP-2 collectives.
-            if len(data) < n_actors:
-                raise ValueError(
-                    f"FSDP forward requires len(data) >= fsdp_num_gpus (world_size). "
-                    f"Got len(data)={len(data)}, world_size={n_actors}. "
-                    f"Sending fewer datums than ranks leaves some ranks idle and causes "
-                    f"NCCL collectives in other ranks to hang permanently, deadlocking "
-                    f"the entire training_run record's execution lock. Increase batch "
-                    f"size or upstream chunking, or set fsdp_num_gpus=1 in tuft_config.yaml."
-                )
+            # NCCL symmetry: each actor must run the same number of
+            # micro-batches, else FSDP-2 collectives deadlock. The tinker SDK's
+            # byte-budget request chunking (5MB / 1024-item greedy packing)
+            # can emit 1-3 datum remainder sub-requests, which cannot be
+            # sharded across ranks. Dispatch those REPLICATED instead: every
+            # actor runs the identical full batch, per-rank gradients are
+            # identical, and the FSDP2 reduce-scatter average recovers the
+            # exact small-batch gradient (engine skips the world_size loss
+            # compensation in replicated mode).
+            replicated = len(data) < n_actors
 
-            shards = _shard_list(data, n_actors)
+            shards = _shard_list(data, n_actors) if not replicated else [data] * n_actors
 
             # In multi-actor mode every actor must issue the same number of
             # micro-batches, otherwise FSDP-2 NCCL collectives deadlock
             # (one rank finishes early while others are still iterating).
-            # Only use micro-batching when mb evenly divides ALL shard sizes;
-            # otherwise fall back to single-batch per shard (mb=None).
-            if mb > 0 and all(len(s) % mb == 0 for s in shards if s):
-                # Still need same micro-batch count: check that all non-empty
-                # shards produce the same n_micro.
-                micro_counts = {len(s) // mb for s in shards if s}
-                eff_mb = mb if len(micro_counts) == 1 else None
+            # _uniform_micro_batch_size picks the largest size that satisfies
+            # that while still bounding per-micro-batch memory.
+            if not replicated:
+                if n_actors == 1:
+                    # Single rank: there is no collective to deadlock, so honour
+                    # the configured micro-batch size even when it does not
+                    # divide the shard. Passing None here makes the actor fall
+                    # back to the whole batch as one micro-batch, which is what
+                    # OOMs the GPU on batches whose size is not a multiple of mb.
+                    eff_mb = mb if mb > 0 else None
+                else:
+                    eff_mb = _uniform_micro_batch_size([len(s) for s in shards], mb)
             else:
+                # All ranks hold the same data; any mb divides it identically,
+                # but tiny batches are cheap — one micro-batch keeps it simple.
                 eff_mb = None
 
             self.logger.info(
-                "FSDP multi-actor forward: batch=%d actors=%d mb=%s eff_mb=%s",
+                "FSDP multi-actor forward: batch=%d actors=%d mb=%s eff_mb=%s replicated=%s",
                 len(data),
                 n_actors,
                 mb,
                 eff_mb,
+                replicated,
             )
 
             refs = []
@@ -1167,16 +1623,24 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                         loss_fn_config,
                         not backward,
                         eff_mb,
+                        replicated,
                     )
                 )
                 ref_weights.append(len(shard))
 
             results = await asyncio.to_thread(ray.get, refs) if refs else []
 
-            metrics = _merge_metrics(results, ref_weights)
-            loss_fn_outputs = []
-            for out in results:
-                loss_fn_outputs.extend(out.get("loss_fn_outputs", []))
+            if replicated:
+                # Every actor returned identical outputs; keep one copy so
+                # metrics and loss_fn_outputs are not counted n_actors times.
+                first = results[0] if results else {"metrics": {}, "loss_fn_outputs": []}
+                metrics = dict(first.get("metrics") or {})
+                loss_fn_outputs = list(first.get("loss_fn_outputs") or [])
+            else:
+                metrics = _merge_metrics(results, ref_weights)
+                loss_fn_outputs = []
+                for out in results:
+                    loss_fn_outputs.extend(out.get("loss_fn_outputs", []))
 
         # Tinker expects every metric key to be "name:reduction" (e.g. loss:sum)
         metrics = {k: v for k, v in metrics.items() if ":" in k}
@@ -1197,7 +1661,7 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         if self._worker is not None:
             async with self._lock:
                 result = await asyncio.to_thread(
-                    self._worker.optim_step,
+                    cast(Any, self._worker).optim_step,
                     adapter_name,
                     adam_params.learning_rate,
                     adam_params.weight_decay,
@@ -1231,15 +1695,36 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         optimizer: bool,
     ) -> None:
         adapter_name = self._get_adapter_name(lora_id)
-        path = checkpoint_record.adapter_path
+        full_mode = self._training_mode == "full_param"
+        sampler = checkpoint_record.checkpoint_type == "sampler"
+        if full_mode:
+            path = (
+                checkpoint_record.model_path if sampler else checkpoint_record.training_state_path
+            )
+        else:
+            path = checkpoint_record.adapter_path
+
         if self._worker is not None:
             async with self._lock:
-                await asyncio.to_thread(self._worker.save_checkpoint, adapter_name, path, optimizer)
+                if full_mode and isinstance(self._worker, FullParamFSDPWorker):
+                    if sampler:
+                        await asyncio.to_thread(
+                            self._worker.save_sampler_checkpoint, adapter_name, path
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self._worker.save_checkpoint, adapter_name, path, optimizer
+                        )
+                else:
+                    await asyncio.to_thread(
+                        cast(Any, self._worker).save_checkpoint, adapter_name, path, optimizer
+                    )
         else:
             import ray
 
             refs = [
-                a.save_checkpoint.remote(adapter_name, str(path), optimizer) for a in self._actors
+                a.save_checkpoint.remote(adapter_name, str(path), optimizer, sampler)
+                for a in self._actors
             ]
             await asyncio.to_thread(ray.get, refs)
 
@@ -1249,11 +1734,27 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         checkpoint_record: CheckpointRecord,
         optimizer: bool,
     ) -> None:
+        full_mode = self._training_mode == "full_param"
+        if checkpoint_record.checkpoint_type != "training":
+            raise ValueError("Full-param load_state only supports training checkpoints.")
+        if (
+            full_mode
+            and getattr(checkpoint_record.metadata, "training_mode", "lora") != "full_param"
+        ):
+            raise ValueError("Cannot load a LoRA checkpoint into a full-param training backend.")
+
+        if lora_id not in self._lora_id_to_adapter_name:
+            rank = getattr(checkpoint_record.metadata, "lora_rank", None) or 8
+            await self.create_adapter(lora_id, types.LoraConfig(rank=rank))
         adapter_name = self._get_adapter_name(lora_id)
-        path = checkpoint_record.adapter_path
+        path = (
+            checkpoint_record.training_state_path if full_mode else checkpoint_record.adapter_path
+        )
         if self._worker is not None:
             async with self._lock:
-                await asyncio.to_thread(self._worker.load_checkpoint, adapter_name, path, optimizer)
+                await asyncio.to_thread(
+                    cast(Any, self._worker).load_checkpoint, adapter_name, path, optimizer
+                )
         else:
             import ray
 

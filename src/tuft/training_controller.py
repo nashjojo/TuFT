@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,10 +60,11 @@ class TrainingRunRecord(BaseModel):
 
     training_run_id: str
     base_model: str
-    lora_rank: int
+    lora_rank: int | None = None
     session_id: str
     model_owner: str
     user_metadata: dict[str, str] | None = None
+    training_mode: str = "lora"
     created_at: datetime = Field(default_factory=_now)
     last_request_time: datetime = Field(default_factory=_now)
     # Checkpoints are stored separately, excluded from serialization
@@ -84,7 +86,7 @@ class TrainingRunRecord(BaseModel):
             training_run_id=self.training_run_id,
             base_model=self.base_model,
             model_owner=self.model_owner,
-            is_lora=True,
+            is_lora=self.training_mode == "lora",
             corrupted=self.corrupted,
             lora_rank=self.lora_rank,
             last_request_time=self.last_request_time,
@@ -110,9 +112,18 @@ class TrainingController:
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.training_mode = os.getenv("TUFT_TRAINING_MODE", "lora")
+        if self.training_mode not in {"lora", "full_param"}:
+            raise ValueError(
+                f"TUFT_TRAINING_MODE must be 'lora' or 'full_param', got '{self.training_mode}'"
+            )
         self.training_backends = self._create_backends(config.supported_models)
         # TODO: add a mechanism to manage training_runs
         self.training_runs: Dict[str, TrainingRunRecord] = {}
+        # Set by ServerState to SamplingController.reset_full_deployment. Kept
+        # optional because TrainingController is constructed first and tests
+        # build it standalone.
+        self.on_full_param_run_unloaded: Optional[Callable[[str], Awaitable[None]]] = None
         self._restore_from_redis()
 
     def _create_backends(self, model_configs: List[ModelConfig]) -> Dict[str, BaseTrainingBackend]:
@@ -129,6 +140,7 @@ class TrainingController:
                 config,
                 fsdp_index=fsdp_index,
                 worker_venv_path=self.config.worker_venv_path,
+                training_mode=self.training_mode,
             )
         return backends
 
@@ -168,6 +180,11 @@ class TrainingController:
             # Restore checkpoints (stored separately, not subject to TTL)
             self._restore_checkpoints(model_id, record)
             self._restore_sampler_checkpoints(model_id, record)
+            # A process is either LoRA or full-param; leave the other mode's
+            # records persisted but unbound so they are not loaded into the
+            # wrong backend or marked corrupted.
+            if record.training_mode != self.training_mode:
+                continue
             # Restore backend reference
             if record.base_model in self.training_backends:
                 record.backend = self.training_backends[record.base_model]
@@ -320,12 +337,32 @@ class TrainingController:
         lora_config: types.LoraConfig,
         model_owner: str,
         user_metadata: dict[str, str] | None,
+        model_id: str | None = None,
     ) -> TrainingRunRecord:
-        model_id = str(uuid.uuid4())
+        model_id = model_id or str(uuid.uuid4())
+        requested_mode = (user_metadata or {}).get("training_mode", "lora")
+        if requested_mode not in {"lora", "full_param"}:
+            raise ValueError(f"Unknown training_mode '{requested_mode}'")
+        if requested_mode != self.training_mode:
+            raise ValueError(
+                f"TuFT server is running in '{self.training_mode}' mode; "
+                f"cannot create a '{requested_mode}' training run."
+            )
+        if requested_mode == "full_param":
+            existing_full_runs = [
+                record.training_run_id
+                for record in self.training_runs.values()
+                if record.training_mode == "full_param" and record.model_owner == model_owner
+            ]
+            if existing_full_runs and model_id not in existing_full_runs:
+                raise ValueError(
+                    f"Only one full-param run is supported; {existing_full_runs[0]} already exists."
+                )
         with _get_tracer().start_as_current_span("training_controller.create_model") as span:
             span.set_attribute("tuft.training_run_id", model_id)
             span.set_attribute("tuft.session_id", session_id)
             span.set_attribute("tuft.base_model", base_model)
+            span.set_attribute("tuft.training_mode", requested_mode)
             span.set_attribute("tuft.lora_rank", lora_config.rank)
             try:
                 logger.info("Creating model %s", model_id)
@@ -336,10 +373,14 @@ class TrainingController:
                 record = TrainingRunRecord(
                     training_run_id=model_id,
                     base_model=base_model,
+                    # Keep the carrier rank even in full-param mode: restore
+                    # rebuilds a LoraConfig from it, and is_lora comes from
+                    # training_mode rather than from this field.
                     lora_rank=lora_config.rank,
                     session_id=session_id,
                     model_owner=model_owner,
                     user_metadata=user_metadata,
+                    training_mode=requested_mode,
                     backend=backend,
                 )
                 await backend.create_adapter(model_id, lora_config)
@@ -468,8 +509,13 @@ class TrainingController:
         base_model = record.base_model
         if record.backend is not None:
             await record.backend.remove_adapter(model_id)
+            if record.training_mode == "full_param":
+                await record.backend.shutdown()
         del self.training_runs[model_id]
         self._delete_training_run(model_id)
+
+        if record.training_mode == "full_param" and self.on_full_param_run_unloaded is not None:
+            await self.on_full_param_run_unloaded(base_model)
 
         # Update metrics
         get_metrics().training_models_active.add(-1, {"base_model": base_model})
@@ -504,7 +550,7 @@ class TrainingController:
         return types.GetInfoResponse(
             model_data=model_data,
             model_id=model_id,
-            is_lora=True,
+            is_lora=record.training_mode == "lora",
             lora_rank=record.lora_rank,
             model_name=record.base_model,
         )
@@ -562,10 +608,12 @@ class TrainingController:
                     )
 
                 # Write metadata once so metadata.json exists
+                checkpoint.training_mode = training_run.training_mode
                 checkpoint.save_metadata(
                     base_model=training_run.base_model,
                     session_id=training_run.session_id,
                     lora_rank=training_run.lora_rank,
+                    training_mode=training_run.training_mode,
                 )
 
                 # Compute total size including metadata.json
@@ -576,6 +624,7 @@ class TrainingController:
                     base_model=training_run.base_model,
                     session_id=training_run.session_id,
                     lora_rank=training_run.lora_rank,
+                    training_mode=training_run.training_mode,
                 )
                 # save the checkpoint record in the training run
                 target_map[checkpoint_name] = checkpoint
@@ -624,12 +673,12 @@ class TrainingController:
         except FileNotFoundError as exc:
             raise CheckpointNotFoundException(checkpoint_id=model_id) from exc
         source_model_id = parsed_checkpoint.training_run_id or model_id
-        training_run = self.get_run_record(source_model_id, user_id, enforce_user_match=False)
+        source_run = self.get_run_record(source_model_id, user_id, enforce_user_match=False)
 
         collection = (
-            training_run.checkpoints
+            source_run.checkpoints
             if parsed_checkpoint.checkpoint_type == "training"
-            else training_run.sampler_checkpoints
+            else source_run.sampler_checkpoints
         )
 
         checkpoint = collection.get(parsed_checkpoint.checkpoint_id)
@@ -642,22 +691,36 @@ class TrainingController:
                 checkpoint_id=parsed_checkpoint.checkpoint_id
             ) from exc
         if metadata.public or (metadata.owner_name == user_id):
-            if training_run.backend is None:
+            # The checkpoint's source run locates the files and authorizes
+            # access; the weights load into the CALLER's run when it is a
+            # different, existing training run. That is the resume flow:
+            # create_training_client_from_state creates a fresh run and then
+            # loads a previous checkpoint into it — without this the weights
+            # would land in the (possibly stale or slot-less) source run
+            # while the caller trains on random initialization.
+            if model_id in self.training_runs and model_id != source_model_id:
+                target_run = self.get_run_record(model_id, user_id)
+            else:
+                target_run = source_run
+
+            if target_run.backend is None:
                 raise UnknownModelException(model_name=model_id)
 
             checkpoint_id = parsed_checkpoint.checkpoint_id
-            logger.info("Checkpoint load begin: %s", checkpoint_id)
+            logger.info(
+                "Checkpoint load begin: %s into run %s", checkpoint_id, target_run.training_run_id
+            )
 
             async def _operation() -> None:
-                assert training_run.backend is not None
-                await training_run.backend.load_state(
-                    lora_id=training_run.training_run_id,
+                assert target_run.backend is not None
+                await target_run.backend.load_state(
+                    lora_id=target_run.training_run_id,
                     checkpoint_record=checkpoint,
                     optimizer=optimizer,
                 )
                 logger.info("Checkpoint loaded: %s", checkpoint_id)
 
-            await self._with_sequence_guard(training_run, seq_id, _operation)
+            await self._with_sequence_guard(target_run, seq_id, _operation)
         else:
             raise CheckpointAccessDeniedException(checkpoint_id=parsed_checkpoint.checkpoint_id)
 
@@ -735,7 +798,7 @@ class TrainingController:
         training_run = self.get_run_record(model_id, user_id)
         return types.WeightsInfoResponse(
             base_model=training_run.base_model,
-            is_lora=True,
+            is_lora=training_run.training_mode == "lora",
             lora_rank=training_run.lora_rank,
         )
 
@@ -751,11 +814,43 @@ class TrainingController:
         return max(all_checkpoints, key=lambda c: c.created_at)
 
     async def restore_from_checkpoint(self, model_id: str) -> CheckpointRecord | None:
-        latest_ckpt = self.get_latest_checkpoint(model_id)
-        if latest_ckpt is None:
-            return None
         record = self.training_runs.get(model_id)
         if record is None or record.backend is None:
+            return None
+
+        if record.training_mode == "full_param":
+            # Opposite ordering from LoRA: the worker refuses load_state until
+            # the run is bound, and only training checkpoints are loadable, so
+            # bind first and resume from the latest training checkpoint.
+            try:
+                # Full-param workers ignore the rank; it is only a carrier so the
+                # shared create_adapter signature stays uniform.
+                await record.backend.create_adapter(
+                    model_id, types.LoraConfig(rank=record.lora_rank or 1)
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Failed to bind full-param run %s during restore", model_id)
+            latest_ckpt = self.get_latest_checkpoint(model_id)
+            if record.checkpoints:
+                resume_ckpt = max(record.checkpoints.values(), key=lambda c: c.created_at)
+                try:
+                    await record.backend.load_state(
+                        lora_id=model_id, checkpoint_record=resume_ckpt, optimizer=True
+                    )
+                except Exception:  # pylint: disable=broad-except
+                    record.corrupted = True
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, self._save_training_run, model_id)
+                    logger.warning(
+                        "Checkpoint load failed for %s; returning checkpoint "
+                        "with future_id=%d for future cleanup",
+                        model_id,
+                        resume_ckpt.future_id,
+                    )
+            return latest_ckpt
+
+        latest_ckpt = self.get_latest_checkpoint(model_id)
+        if latest_ckpt is None:
             return None
         # load_state calls load_adapter which creates the adapter from the
         # checkpoint on disk.  Calling create_adapter first causes PEFT's
@@ -771,9 +866,10 @@ class TrainingController:
             # load_state failed – try create_adapter + load_state as fallback
             logger.warning("load_state failed for %s, trying create_adapter fallback", model_id)
             try:
-                await record.backend.create_adapter(
-                    model_id, types.LoraConfig(rank=record.lora_rank)
-                )
+                rank = record.lora_rank
+                if rank is None:
+                    raise ValueError(f"LoRA run {model_id} has no recorded rank")
+                await record.backend.create_adapter(model_id, types.LoraConfig(rank=rank))
             except Exception:
                 logger.exception("Failed to create adapter for model %s during restore", model_id)
             try:

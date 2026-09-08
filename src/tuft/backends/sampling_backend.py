@@ -99,6 +99,17 @@ class VLLMSamplingBackend(BaseSamplingBackend):
         self._counter = 1
         self._lock = asyncio.Lock()
         self._openai_api_url: Optional[str] = None
+        self._gate_open = True
+        self._active_requests = 0
+        self._gate_condition = asyncio.Condition()
+        self._deploy_lock = asyncio.Lock()
+        self._base_weights_path = str(config.model_path)
+        self._active_weights_path: Optional[str] = None
+        self._active_deployment_id: Optional[str] = None
+        # Set when a request surfaces a dead EngineCore. The gate alone cannot
+        # express this: it reopens after a deploy even if the restart failed,
+        # which would let healthz report 200 while nothing can serve requests.
+        self._engine_dead = False
 
     def _create_engine(self, config: ModelConfig):
         if config.colocate:
@@ -188,12 +199,19 @@ class VLLMSamplingBackend(BaseSamplingBackend):
         else:
             _path = os.environ.get("PATH", "")
             _venv_python = str(Path(self._worker_venv_path) / "bin" / "python")
+            _env_vars = {
+                "VIRTUAL_ENV": self._worker_venv_path,
+                "PATH": f"{self._worker_venv_path}/bin:{_path}",
+            }
+            # Optional GPU allowlist for sampling engines, e.g. "1,2,3" to
+            # isolate a suspected-faulty GPU. Ray schedules the actor only on
+            # a listed device; inside the actor it still sees one GPU (cuda:0).
+            _sampling_gpus = os.environ.get("TUFT_SAMPLING_GPUS", "").strip()
+            if _sampling_gpus:
+                _env_vars["CUDA_VISIBLE_DEVICES"] = _sampling_gpus
             _runtime_env = {
                 "py_executable": _venv_python,
-                "env_vars": {
-                    "VIRTUAL_ENV": self._worker_venv_path,
-                    "PATH": f"{self._worker_venv_path}/bin:{_path}",
-                },
+                "env_vars": _env_vars,
             }
 
         # Use instance_index to differentiate Ray actor names for DP replicas
@@ -202,9 +220,11 @@ class VLLMSamplingBackend(BaseSamplingBackend):
             actor_name = f"{actor_name}_dp{self._instance_index}"
 
         # In standalone/DP mode, each vLLM instance has a dedicated GPU.
-        # Use 0.9 (vLLM default) for max KV cache, not sampling_memory_fraction
-        # which is designed for colocate mode (shared GPU with training).
-        standalone_gpu_memory_utilization = 0.9
+        # Use 0.85 (slightly below vLLM default 0.9) to leave ~8GB headroom
+        # for prefix-caching KV eviction churn and peak prefill allocations.
+        # At 0.9 the engine hits 76.9/79.2GB and a 4GB prefill allocation
+        # triggers CUDA OOM (2026-09-06 18:30 crash, prefix_caching ON).
+        standalone_gpu_memory_utilization = 0.80
 
         return (
             ray.remote(VLLMEngine)
@@ -278,66 +298,95 @@ class VLLMSamplingBackend(BaseSamplingBackend):
             span.set_attribute("tuft.num_samples", num_samples)
             span.set_attribute("tuft.has_lora", lora_id is not None)
             try:
-                async with self._lock:
-                    if lora_id is not None and lora_id not in self.lora_adapters:
-                        raise ValueError(f"LoRA adapter {lora_id} not found in backend.")
-                    lora_request = self.lora_adapters[lora_id] if lora_id is not None else None
-
-                prompt_token_ids = prompt.to_ints()
-                params = {
-                    "max_tokens": (
-                        sampling_params.max_tokens if sampling_params.max_tokens is not None else 16
-                    ),
-                    "seed": sampling_params.seed,
-                    "top_k": sampling_params.top_k,
-                    "top_p": sampling_params.top_p,
-                    "temperature": sampling_params.temperature,
-                    "n": num_samples,
-                    "prompt_logprobs": (topk_prompt_logprobs if include_prompt_logprobs else None),
-                    "logprobs": 0,
-                }
-                # Avoid prefix cache reads when computing prompt logprobs
-                # (cached prompt chunks would otherwise skip logit computation
-                # and corrupt the returned logprobs). Native vLLM SamplingParams
-                # field since 0.12; newer vLLM auto-sets it when prompt_logprobs
-                # is requested -- kept explicit here for clarity.
-                if include_prompt_logprobs:
-                    params["skip_reading_prefix_cache"] = True
-                if sampling_params.stop is not None:
-                    # tinker.SamplingParams.stop accepts a heterogeneous list of
-                    # str (substring stops) and int (token-id stops). vLLM
-                    # however expects them in two separate fields: `stop`
-                    # (list[str]) and `stop_token_ids` (list[int]). Forwarding
-                    # the raw list to vLLM's `stop` triggers `TypeError: object
-                    # of type 'int' has no len()` inside
-                    # SamplingParams.__post_init__ (vllm/sampling_params.py:358).
-                    # Split by isinstance to route each kind correctly.
-                    str_stops: list[str] = [s for s in sampling_params.stop if isinstance(s, str)]
-                    int_stops: list[int] = [
-                        s
-                        for s in sampling_params.stop
-                        if isinstance(s, int) and not isinstance(s, bool)
-                    ]
-                    if str_stops:
-                        params["stop"] = str_stops
-                    if int_stops:
-                        params["stop_token_ids"] = int_stops
-
-                # Ray @ray.remote decorator adds .remote() method dynamically
-                req_output = await self.engine.generate.remote(  # type: ignore[attr-defined]
-                    prompt={"prompt_token_ids": prompt_token_ids},
-                    lora_request=lora_request,
-                    **params,
-                )
-                return _build_sample_response(
-                    req_output=req_output,
-                    include_prompt_logprobs=include_prompt_logprobs,
-                    topk_prompt_logprobs=topk_prompt_logprobs,
-                )
+                async with self._gate_condition:
+                    await self._gate_condition.wait_for(lambda: self._gate_open)
+                    self._active_requests += 1
+                try:
+                    return await self._sample_locked(
+                        prompt=prompt,
+                        num_samples=num_samples,
+                        sampling_params=sampling_params,
+                        include_prompt_logprobs=include_prompt_logprobs,
+                        topk_prompt_logprobs=topk_prompt_logprobs,
+                        lora_id=lora_id,
+                    )
+                finally:
+                    async with self._gate_condition:
+                        self._active_requests -= 1
+                        self._gate_condition.notify_all()
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(StatusCode.ERROR)
+                # Ray wraps the actor-side exception, so match on the rendered
+                # text rather than the exception type.
+                if "EngineDeadError" in str(e) or "EngineDeadError" in repr(e):
+                    self._engine_dead = True
+                    logger.error("vLLM EngineCore is dead; marking backend unavailable")
                 raise
+
+    async def _sample_locked(
+        self,
+        prompt: types.ModelInput,
+        num_samples: int,
+        sampling_params: types.SamplingParams,
+        include_prompt_logprobs: bool = False,
+        topk_prompt_logprobs: int = 0,
+        lora_id: Optional[str] = None,
+    ) -> types.SampleResponse:
+        async with self._lock:
+            if lora_id is not None and lora_id not in self.lora_adapters:
+                raise ValueError(f"LoRA adapter {lora_id} not found in backend.")
+            lora_request = self.lora_adapters[lora_id] if lora_id is not None else None
+
+        prompt_token_ids = prompt.to_ints()
+        params = {
+            "max_tokens": (
+                sampling_params.max_tokens if sampling_params.max_tokens is not None else 16
+            ),
+            "seed": sampling_params.seed,
+            "top_k": sampling_params.top_k,
+            "top_p": sampling_params.top_p,
+            "temperature": sampling_params.temperature,
+            "n": num_samples,
+            "prompt_logprobs": (topk_prompt_logprobs if include_prompt_logprobs else None),
+            "logprobs": 0,
+        }
+        # Avoid prefix cache reads when computing prompt logprobs
+        # (cached prompt chunks would otherwise skip logit computation
+        # and corrupt the returned logprobs). Native vLLM SamplingParams
+        # field since 0.12; newer vLLM auto-sets it when prompt_logprobs
+        # is requested -- kept explicit here for clarity.
+        if include_prompt_logprobs:
+            params["skip_reading_prefix_cache"] = True
+        if sampling_params.stop is not None:
+            # tinker.SamplingParams.stop accepts a heterogeneous list of
+            # str (substring stops) and int (token-id stops). vLLM
+            # however expects them in two separate fields: `stop`
+            # (list[str]) and `stop_token_ids` (list[int]). Forwarding
+            # the raw list to vLLM's `stop` triggers `TypeError: object
+            # of type 'int' has no len()` inside
+            # SamplingParams.__post_init__ (vllm/sampling_params.py:358).
+            # Split by isinstance to route each kind correctly.
+            str_stops: list[str] = [s for s in sampling_params.stop if isinstance(s, str)]
+            int_stops: list[int] = [
+                s for s in sampling_params.stop if isinstance(s, int) and not isinstance(s, bool)
+            ]
+            if str_stops:
+                params["stop"] = str_stops
+            if int_stops:
+                params["stop_token_ids"] = int_stops
+
+        # Ray @ray.remote decorator adds .remote() method dynamically
+        req_output = await self.engine.generate.remote(  # type: ignore[attr-defined]
+            prompt={"prompt_token_ids": prompt_token_ids},
+            lora_request=lora_request,
+            **params,
+        )
+        return _build_sample_response(
+            req_output=req_output,
+            include_prompt_logprobs=include_prompt_logprobs,
+            topk_prompt_logprobs=topk_prompt_logprobs,
+        )
 
     async def add_adapter(self, lora_id: str, adapter_path: Path) -> None:
         from vllm.lora.request import LoRARequest
@@ -378,6 +427,88 @@ class VLLMSamplingBackend(BaseSamplingBackend):
                     lora_request = self.lora_adapters.pop(lora_id)
                     await self.engine.remove_lora.remote(lora_request.lora_int_id)  # type: ignore[attr-defined]
 
+    async def reload_weights(self, weights_path: str) -> None:
+        await self.engine.reload_full_weights.remote(weights_path)  # type: ignore[attr-defined]
+        # The reload restarts the engine, which rebinds an ephemeral port for
+        # the embedded OpenAI server, so the cached URL goes stale.
+        self._openai_api_url = await self.engine.get_api_server_url.remote()  # type: ignore[attr-defined]
+        if self._openai_api_url:
+            await self._wait_for_openai_server(self._openai_api_url)
+        # A restart that got this far produced a live engine again.
+        self._engine_dead = False
+
+    async def get_health(self) -> bool:
+        return await self.engine.get_health.remote()  # type: ignore[attr-defined]
+
+    async def deploy_full_weights(self, weights_path: Path, deployment_id: str) -> None:
+        async with self._deploy_lock:
+            if self._active_deployment_id == deployment_id:
+                return
+            previous_weights = self._active_weights_path or str(self.config.model_path)
+            previous_deployment_id = self._active_deployment_id
+            await self.close_gate_and_drain()
+            try:
+                await self.reload_weights(str(weights_path))
+                if not await self.get_health():
+                    raise RuntimeError(f"vLLM engine unhealthy after reloading {weights_path}")
+            except Exception:
+                try:
+                    await self.reload_weights(previous_weights)
+                    self._active_weights_path = previous_weights
+                    self._active_deployment_id = previous_deployment_id
+                except Exception:
+                    logger.error("Full-weight rollback to %s failed", previous_weights)
+                    self._active_weights_path = None
+                    self._active_deployment_id = None
+                raise
+            finally:
+                async with self._gate_condition:
+                    self._gate_open = True
+                    self._gate_condition.notify_all()
+            self._active_weights_path = str(weights_path)
+            self._active_deployment_id = deployment_id
+            logger.info("Deployed full weights %s (%s)", weights_path, deployment_id)
+
+    def get_active_deployment_id(self) -> Optional[str]:
+        return self._active_deployment_id
+
+    def get_active_weights_path(self) -> Optional[str]:
+        return self._active_weights_path
+
+    async def revert_to_base_weights(self) -> None:
+        """Reload the base model and clear the full-weight deployment state.
+
+        Without this the backend keeps rejecting base-model sampling sessions
+        after a full-param run deploys weights, even once that run is gone,
+        which blocks the next run from creating its initial base session.
+        """
+        if self._active_deployment_id is None:
+            return
+        async with self._deploy_lock:
+            await self.close_gate_and_drain()
+            try:
+                await self.reload_weights(str(self.config.model_path))
+            finally:
+                async with self._gate_condition:
+                    self._gate_open = True
+                    self._gate_condition.notify_all()
+            self._active_weights_path = None
+            self._active_deployment_id = None
+            logger.info("Reverted to base weights %s", self.config.model_path)
+
+    def is_ready(self) -> bool:
+        return self._gate_open and not self._engine_dead
+
+    async def wait_ready(self) -> None:
+        async with self._gate_condition:
+            await self._gate_condition.wait_for(lambda: self._gate_open)
+
+    async def close_gate_and_drain(self) -> None:
+        """Stop admitting requests and wait for the in-flight ones to finish."""
+        async with self._gate_condition:
+            self._gate_open = False
+            await self._gate_condition.wait_for(lambda: self._active_requests == 0)
+
     async def shutdown(self) -> None:
         """Shut down the vLLM engine Ray actor and release GPU resources."""
         import ray
@@ -417,6 +548,11 @@ class DPSamplingBackend(BaseSamplingBackend):
         # Atomic round-robin counter
         self._rr_counter = 0
         self._rr_lock = asyncio.Lock()
+        self._deploy_lock = asyncio.Lock()
+        self._active_deployment_id: Optional[str] = None
+        self._active_weights_path: Optional[str] = None
+        self._deploy_task: Optional[asyncio.Task] = None
+        self._deploy_task_id: Optional[str] = None
         logger.info(
             "DPSamplingBackend: created %d instances for model %s",
             self._dp_size,
@@ -506,6 +642,80 @@ class DPSamplingBackend(BaseSamplingBackend):
     async def remove_adapter(self, lora_id: str) -> None:
         """Remove LoRA adapter from ALL DP instances."""
         await asyncio.gather(*[inst.remove_adapter(lora_id) for inst in self._instances])
+
+    async def deploy_full_weights(self, weights_path: Path, deployment_id: str) -> None:
+        if self._active_deployment_id == deployment_id:
+            return
+        # A concurrent caller for the same revision joins the running deploy
+        # instead of queueing a second engine restart behind the lock.
+        if self._deploy_task is not None and self._deploy_task_id == deployment_id:
+            await asyncio.shield(self._deploy_task)
+            return
+        async with self._deploy_lock:
+            if self._active_deployment_id == deployment_id:
+                return
+            self._deploy_task = asyncio.current_task()
+            self._deploy_task_id = deployment_id
+            try:
+                await self._deploy_full_weights_locked(weights_path, deployment_id)
+            finally:
+                self._deploy_task = None
+                self._deploy_task_id = None
+
+    async def _deploy_full_weights_locked(self, weights_path: Path, deployment_id: str) -> None:
+        previous_weights = self._active_weights_path or str(self.config.model_path)
+        await asyncio.gather(*[inst.close_gate_and_drain() for inst in self._instances])
+        try:
+            logger.info("Reloading %d vLLM replicas from %s", self._dp_size, weights_path)
+            await asyncio.gather(
+                *[inst.reload_weights(str(weights_path)) for inst in self._instances]
+            )
+            health = await asyncio.gather(*[inst.get_health() for inst in self._instances])
+            if not all(health):
+                raise RuntimeError("One or more vLLM replicas became unhealthy during reload")
+        except Exception:
+            rollback_errors = await asyncio.gather(
+                *[inst.reload_weights(previous_weights) for inst in self._instances],
+                return_exceptions=True,
+            )
+            failures = [e for e in rollback_errors if isinstance(e, BaseException)]
+            if failures:
+                logger.error("Full-weight rollback failed: %s", failures)
+            raise
+        finally:
+            for inst in self._instances:
+                async with inst._gate_condition:
+                    inst._gate_open = True
+                    inst._gate_condition.notify_all()
+        self._active_weights_path = str(weights_path)
+        self._active_deployment_id = deployment_id
+        logger.info(
+            "Deployed full weights %s (%s) to %d vLLM replicas",
+            weights_path,
+            deployment_id,
+            self._dp_size,
+        )
+
+    def get_active_deployment_id(self) -> Optional[str]:
+        return self._active_deployment_id
+
+    def get_active_weights_path(self) -> Optional[str]:
+        return self._active_weights_path
+
+    async def revert_to_base_weights(self) -> None:
+        """Revert every DP replica to the base model and clear deployment state."""
+        if self._active_deployment_id is None:
+            return
+        await asyncio.gather(*[inst.revert_to_base_weights() for inst in self._instances])
+        self._active_weights_path = None
+        self._active_deployment_id = None
+        logger.info("Reverted %d DP replicas to base weights", self._dp_size)
+
+    def is_ready(self) -> bool:
+        return all(inst.is_ready() for inst in self._instances)
+
+    async def wait_ready(self) -> None:
+        await asyncio.gather(*[inst.wait_ready() for inst in self._instances])
 
     async def shutdown(self) -> None:
         """Shut down all DP vLLM instances."""

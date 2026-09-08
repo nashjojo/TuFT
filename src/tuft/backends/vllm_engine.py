@@ -152,8 +152,19 @@ class VLLMEngine:
                 seed=self.config.seed,
                 distributed_executor_backend="mp",
                 max_model_len=self.config.max_model_len,  # type: ignore[arg-type]
+                # Prefix caching ON (re-enabled 2026-09-06): the seven engine
+                # crashes were root-caused to vLLM+FSDP GPU colocation, NOT
+                # prefix_caching. With the 4+4 disjoint GPU partition in place,
+                # prefix caching is safe. RL step-wise rollouts share prefixes
+                # across steps; APC reuses those KV blocks for ~18x prefill
+                # savings.
                 enable_prefix_caching=True,
-                enable_chunked_prefill=True,
+                # Chunked prefill OFF: the last engine flag never compared
+                # against the crash-free verl baseline (crash 7 analysis,
+                # 2026-09-06). Batches a request's prefill with decodes from
+                # other requests - orthogonal to throughput for our load
+                # (prefill is ~5% of rollout time).
+                enable_chunked_prefill=False,
                 dtype=self.config.dtype,  # type: ignore[arg-type]
                 trust_remote_code=True,
                 gpu_memory_utilization=self.config.gpu_memory_utilization,
@@ -168,7 +179,12 @@ class VLLMEngine:
                 # Return logprobs of the actual sampling distribution (after
                 # temperature scaling) -- required for RL importance ratios.
                 logprobs_mode="processed_logprobs",
-                async_scheduling=True,
+                # async_scheduling off: its async output-copy path hit
+                # "CUDA error: an illegal memory access" twice in one hour
+                # under sustained RL rollout load (2026-09-06, GPU 0, both
+                # crashes at update_async_output_token_ids). Cost: ~10-15%
+                # sampling throughput - sampling is not our bottleneck.
+                async_scheduling=False,
             )
             if self.config.quantization:
                 engine_args.quantization = self.config.quantization
@@ -265,6 +281,26 @@ class VLLMEngine:
     async def remove_lora(self, lora_int_id: int) -> None:
         """Remove a LoRA adapter from the engine by its integer id."""
         await self.async_llm.remove_lora(lora_int_id)
+
+    async def reload_full_weights(self, weights_path: str) -> None:
+        # vLLM's collective_rpc("reload_weights") fails on Qwen3 because
+        # initialize_layerwise_reload puts params on meta device and the
+        # AutoWeightsLoader can't map merged gate_up_proj weights correctly.
+        # Fix: shutdown and restart the engine with the new weights path.
+        await self.shutdown()
+        self.config.model_path = weights_path
+        self._prepared = False
+        await self.prepare()
+        await self.async_llm.reset_prefix_cache()
+
+    async def get_health(self) -> bool:
+        # AsyncLLM.check_health() returns None and signals failure by raising.
+        try:
+            await self.async_llm.check_health()
+            return True
+        except Exception:
+            logger.exception("vLLM engine health check failed")
+            return False
 
     async def shutdown(self) -> None:
         """Stop the API server and shut down the engine (kills child procs)."""

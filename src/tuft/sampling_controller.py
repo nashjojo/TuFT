@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
@@ -18,6 +18,7 @@ from .checkpoints import CheckpointRecord
 from .config import AppConfig, ModelConfig
 from .exceptions import (
     CheckpointAccessDeniedException,
+    CheckpointException,
     CheckpointNotFoundException,
     MissingSequenceIDException,
     SessionNotFoundException,
@@ -43,6 +44,13 @@ logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Throttle for sampling-session persistence. History entries are diagnostics
+# (prompt hash/count per request); persisting them on every asample made the
+# per-request cost O(session length) — quadratic over an RL run with tens of
+# thousands of samples in one session. 5s loses at most a few entries on a crash.
+_SESSION_SAVE_INTERVAL_SEC = 5.0
 
 
 class SamplingHistoryEntry(BaseModel):
@@ -73,8 +81,11 @@ class SamplingSessionRecord(BaseModel):
     last_seq_id: int = -1
     history: list[SamplingHistoryEntry] = Field(default_factory=list)
     executor: SequenceExecutor = Field(default_factory=SequenceExecutor, exclude=True)
+    training_mode: str = "lora"
+    checkpoint_id: str | None = None
 
     _history_by_seq_id: dict[int, SamplingHistoryEntry] = PrivateAttr(default_factory=dict)
+    _last_session_save: float = PrivateAttr(default=0.0)
 
 
 class SamplingController:
@@ -82,16 +93,36 @@ class SamplingController:
 
     REDIS_KEY_PREFIX = "sampling_session"
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, training_controller: object | None = None) -> None:
         self.config = config
         self.sampling_sessions: Dict[str, SamplingSessionRecord] = {}
         self._base_backends: Dict[str, BaseSamplingBackend] = self._create_backends(
             config.supported_models
         )
+        self._active_full_deploy_time: Dict[str, datetime] = {}
+        self._training_controller = training_controller
         self._restore_from_redis()
 
     def _build_key(self, session_id: str) -> str:
         return get_redis_store().build_key(self.REDIS_KEY_PREFIX, session_id)
+
+    async def reset_full_deployment(self, base_model: str) -> None:
+        """Revert a base model's replicas to base weights after its run ends.
+
+        While full-param weights are deployed, base-model sampling sessions are
+        rejected so clients cannot silently get the wrong revision. That guard
+        must be lifted when the owning run goes away, otherwise the next run
+        cannot create its initial base-model session.
+        """
+        backend = self._base_backends.get(base_model)
+        if backend is None:
+            return
+        revert: Optional[Callable[[], Awaitable[None]]] = getattr(
+            backend, "revert_to_base_weights", None
+        )
+        if revert is not None:
+            await revert()
+        self._active_full_deploy_time.pop(base_model, None)
 
     def _rebuild_history_index(self, record: SamplingSessionRecord) -> None:
         history_by_seq_id: dict[int, SamplingHistoryEntry] = {}
@@ -199,6 +230,7 @@ class SamplingController:
         base_model_ref: str | None = None
         adapter_path: Path | None = None
         sampling_session_id = str(uuid.uuid4())
+        deployment_id: Optional[str] = None
 
         with _get_tracer().start_as_current_span(
             "sampling_controller.create_sampling_session"
@@ -232,16 +264,70 @@ class SamplingController:
                         )
                     if base_model_ref not in self._base_backends:
                         raise UnknownModelException(model_name=base_model_ref)
-                    adapter_path = parsed_checkpoint.adapter_path
                     sampling_backend = self._base_backends[base_model_ref]
-                    await sampling_backend.add_adapter(
-                        lora_id=sampling_session_id, adapter_path=adapter_path
-                    )
+                    checkpoint_mode = metadata.training_mode
+                    deployment_id = parsed_checkpoint.tinker_path
+                    if checkpoint_mode == "full_param":
+                        # A checkpoint from a different training run must never be
+                        # served: rollout would sample one run's weights while
+                        # training updates another's, silently breaking the RL
+                        # loop. The timestamp guard below cannot catch this on its
+                        # own because _active_full_deploy_time is in-memory and
+                        # empty after a restart, so validate run ownership against
+                        # the training runs this server knows about, which are
+                        # restored from Redis and therefore survive restarts.
+                        known_runs = getattr(self._training_controller, "training_runs", None)
+                        if known_runs is not None and (
+                            parsed_checkpoint.training_run_id not in known_runs
+                        ):
+                            raise CheckpointException(
+                                status_code=409,
+                                detail=(
+                                    f"Checkpoint {parsed_checkpoint.checkpoint_id} belongs to "
+                                    f"training run {parsed_checkpoint.training_run_id}, which is "
+                                    "not an active training run on this server; refusing to "
+                                    f"deploy weights for {base_model_ref} from a foreign run."
+                                ),
+                                checkpoint_id=parsed_checkpoint.checkpoint_id,
+                            )
+                        # Latest checkpoint wins. Only a stale checkpoint is
+                        # refused, because deploying it would roll the served
+                        # weights backward; a newer one must be allowed through.
+                        active_time = self._active_full_deploy_time.get(base_model_ref)
+                        if active_time is not None and parsed_checkpoint.created_at < active_time:
+                            raise CheckpointException(
+                                status_code=409,
+                                detail=(
+                                    f"Checkpoint {parsed_checkpoint.checkpoint_id} is older "
+                                    "than the full-param weights currently deployed for "
+                                    f"{base_model_ref}; refusing to roll weights backward."
+                                ),
+                                checkpoint_id=parsed_checkpoint.checkpoint_id,
+                            )
+                        await sampling_backend.deploy_full_weights(
+                            parsed_checkpoint.model_path, deployment_id
+                        )
+                        self._active_full_deploy_time[base_model_ref] = parsed_checkpoint.created_at
+                    else:
+                        active_id = getattr(sampling_backend, "get_active_deployment_id", None)
+                        if callable(active_id) and active_id() is not None:
+                            raise CheckpointAccessDeniedException(
+                                checkpoint_id=parsed_checkpoint.checkpoint_id
+                            )
+                        await sampling_backend.add_adapter(
+                            lora_id=sampling_session_id, adapter_path=parsed_checkpoint.adapter_path
+                        )
+                        adapter_path = parsed_checkpoint.adapter_path
                     # TODO: remove adapter when session is deleted
                 elif base_model:
                     base_model_ref = base_model
                     if base_model_ref not in self._base_backends:
                         raise UnknownModelException(model_name=base_model_ref)
+                    sampling_backend = self._base_backends[base_model_ref]
+                    active_id = getattr(sampling_backend, "get_active_deployment_id", None)
+                    if callable(active_id) and active_id() is not None:
+                        raise CheckpointAccessDeniedException(checkpoint_id="base-model")
+                    checkpoint_mode = "lora"
                 else:
                     raise UnknownModelException(model_name="None")
                 self.sampling_sessions[sampling_session_id] = SamplingSessionRecord(
@@ -252,6 +338,8 @@ class SamplingController:
                     base_model=base_model_ref,
                     model_path=str(adapter_path) if adapter_path else None,
                     session_seq_id=session_seq_id,
+                    training_mode=checkpoint_mode,
+                    checkpoint_id=deployment_id if model_path else None,
                 )
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self._save_session, sampling_session_id)
@@ -266,20 +354,33 @@ class SamplingController:
                 raise
 
     def _hash_prompt(self, prompt: types.ModelInput) -> str:
-        tokens = ",".join(str(token) for token in prompt.to_ints())
-        return hashlib.sha1(tokens.encode("utf-8")).hexdigest()[:16]
+        # array.to_bytes is one C-level pass; the previous
+        # ",".join(str(t) for t in ...) ran a Python-level generator over
+        # every token and dominated per-request event-loop cost.
+        import array
+
+        buf = array.array("q", prompt.to_ints())
+        return hashlib.sha1(buf.tobytes()).hexdigest()[:16]
 
     async def _record_sequence(
         self, record: SamplingSessionRecord, seq_id: int, prompt: types.ModelInput
     ) -> None:
-        entry = SamplingHistoryEntry(
+        record._history_by_seq_id[seq_id] = SamplingHistoryEntry(
             seq_id=seq_id,
-            prompt_token_count=len(prompt.to_ints()),
+            prompt_token_count=prompt.length,
             prompt_hash=self._hash_prompt(prompt),
         )
-        record._history_by_seq_id[seq_id] = entry
-        record.history = [record._history_by_seq_id[k] for k in sorted(record._history_by_seq_id)]
         record.last_seq_id = max(record.last_seq_id, seq_id)
+
+        now = time.monotonic()
+        if now - record._last_session_save < _SESSION_SAVE_INTERVAL_SEC:
+            return
+        record._last_session_save = now
+        # Materialize the sorted history only at (throttled) save time.
+        # Rebuilding it on every request was O(n log n) per asample and
+        # O(n^2) per session — with RL sessions reaching tens of thousands
+        # of samples this alone pegged the single event loop.
+        record.history = [record._history_by_seq_id[k] for k in sorted(record._history_by_seq_id)]
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._save_session, record.sampling_session_id)
@@ -313,7 +414,7 @@ class SamplingController:
             )
             if record.base_model not in self._base_backends:
                 raise UnknownModelException(model_name=record.base_model)
-            if record.model_path is None:
+            if record.model_path is None or record.training_mode == "full_param":
                 lora_id = None
             else:
                 lora_id = record.sampling_session_id
@@ -339,6 +440,7 @@ class SamplingController:
             start_time = time.perf_counter()
 
             backend, lora_id = await self._resolve_backend(request, user_id=user_id)
+            await backend.wait_ready()
             prompt = request.prompt
             sampling_params = request.sampling_params
             num_samples = request.num_samples

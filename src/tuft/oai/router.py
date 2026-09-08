@@ -244,6 +244,16 @@ def create_oai_router() -> APIRouter:
                 backend = state.sampling._base_backends.get(resolved.base_model)
                 if backend is None:
                     raise UnknownModelException(model_name=resolved.base_model)
+                if not backend.is_ready():
+                    raise ServiceUnavailableException(
+                        f"Sampling backend for {resolved.base_model} is not ready"
+                    )
+                if resolved.training_mode == "full_param":
+                    active_id = getattr(backend, "get_active_deployment_id", None)
+                    if not callable(active_id) or active_id() != resolved.checkpoint_id:
+                        raise ServiceUnavailableException(
+                            "Full-param checkpoint is not currently active"
+                        )
 
                 if isinstance(backend, DPSamplingBackend):
                     backend_url = backend.get_next_openai_api_url()

@@ -123,7 +123,8 @@ class ServerState:
         self.config.check_validity()
         self.sessions = SessionManager()
         self.training = TrainingController(self.config)
-        self.sampling = SamplingController(self.config)
+        self.sampling = SamplingController(self.config, self.training)
+        self.training.on_full_param_run_unloaded = self.sampling.reset_full_deployment
         self.auth_db = AuthenticationDB(self.config.authorized_users)
         self.future_store = FutureStore()
 
@@ -189,6 +190,7 @@ class ServerState:
         lora_config: types.LoraConfig,
         model_owner: str,
         user_metadata: dict[str, str] | None,
+        model_id: str | None = None,
     ) -> TrainingRunRecord:
         self.sessions.require(session_id)
         return await self.training.create_model(
@@ -197,6 +199,7 @@ class ServerState:
             lora_config=lora_config,
             model_owner=model_owner,
             user_metadata=user_metadata,
+            model_id=model_id,
         )
 
     def build_supported_models(self) -> list[types.SupportedModel]:

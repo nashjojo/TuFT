@@ -30,6 +30,9 @@ class ResolvedModel:
     lora_id: Optional[str] = None
     """Identifier for the LoRA adapter (sampling session id)."""
 
+    training_mode: str = "lora"
+    checkpoint_id: Optional[str] = None
+
 
 def resolve_model(
     model_field: str,
@@ -75,6 +78,17 @@ def resolve_model(
                 f"Base model '{base_model_ref}' from checkpoint is not in supported_models."
             )
 
+        checkpoint_name = parsed_checkpoint.checkpoint_id
+        if metadata.training_mode == "full_param":
+            return ResolvedModel(
+                base_model=base_model_ref,
+                # vLLM serves the deployed checkpoint directory under that
+                # path as its model name once the replicas have reloaded it.
+                backend_model_name=str(parsed_checkpoint.model_path),
+                training_mode="full_param",
+                checkpoint_id=parsed_checkpoint.tinker_path,
+            )
+
         adapter_path = parsed_checkpoint.adapter_path
         # Use a checkpoint-unique lora_id so different checkpoints from the
         # same training run are registered as distinct adapters in vLLM and
@@ -82,7 +96,6 @@ def resolve_model(
         # code used training_run_id, which collapsed all checkpoints of a run
         # into one cache entry — the first checkpoint loaded would silently
         # serve every subsequent checkpoint request.
-        checkpoint_name = parsed_checkpoint.checkpoint_id
         lora_id = f"{parsed_checkpoint.training_run_id}:{checkpoint_name}"
 
         if adapter_path.exists():

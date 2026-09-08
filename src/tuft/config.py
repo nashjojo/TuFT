@@ -58,11 +58,25 @@ class ModelConfig(BaseModel):
     # default lora setting
     max_lora_rank: int = 16  # maximum rank for LoRA adapters
     max_loras: int = 1  # maximum number of LoRA adapters that can be applied simultaneously
+    # LoRA target modules for the FSDP backend (PEFT target_modules verbatim).
+    # Default q+v is the conservative set; ["q_proj","k_proj","v_proj","o_proj",
+    # "gate_proj","up_proj","down_proj"] trains ~6x more parameters and is fully
+    # supported by vLLM's Qwen3 LoRA path. Must stay within modules the sampling
+    # engine can serve, or rollout silently diverges from training.
+    lora_target_modules: list[str] | None = None
 
     # default training setting
     micro_batch_size: int = 1  # micro-batch size for training
+    # Token budget per FSDP micro-batch (optional). When set, the effective
+    # micro-batch size for a forward_backward call is capped at
+    # micro_batch_tokens // max_datum_len, so a batch of long datums cannot
+    # materialize oversized activations (OOM). The cap is applied before the
+    # divisibility check, so all ranks still run the same micro-batch count
+    # (NCCL collective symmetry is preserved).
+    micro_batch_tokens: int | None = None
     # training backend: "hf" (HFTrainingBackend) or "fsdp" (FSDPTrainingBackend)
     training_backend: Literal["hf", "fsdp"] = "hf"
+    training_mode: str = Field(default="lora", exclude=True)
     # number of GPUs (Ray actors) for FSDP backend; default 1.
     # Multi-GPU (fsdp_num_gpus >= 2) uses contiguous batch sharding across
     # Ray actors; each actor runs FSDP-2 with micro-batch grad accumulation.

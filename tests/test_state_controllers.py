@@ -187,7 +187,9 @@ async def test_sampling_seq_id_history_is_monotonic(request, tmp_path) -> None:
 
     record = state.sampling.sampling_sessions[sampling_session_id]
     assert record.last_seq_id == 1
-    assert [entry.seq_id for entry in record.history] == [0, 1]
+    # Entries live in the index; the sorted `history` list is materialized
+    # only at (throttled) persistence time.
+    assert sorted(record._history_by_seq_id) == [0, 1]
 
 
 @pytest.mark.asyncio
@@ -225,9 +227,9 @@ async def test_sampling_duplicate_seq_id_overwrites_history_entry(request, tmp_p
 
     record = state.sampling.sampling_sessions[sampling_session_id]
     assert record.last_seq_id == 0
-    assert len(record.history) == 1
-    assert record.history[0].seq_id == 0
-    assert record.history[0].prompt_token_count == 4
+    assert len(record._history_by_seq_id) == 1
+    assert record._history_by_seq_id[0].seq_id == 0
+    assert record._history_by_seq_id[0].prompt_token_count == 4
 
 
 @pytest.mark.asyncio
@@ -317,7 +319,7 @@ async def test_training_seq_id_gap_fast_forward(request, tmp_path) -> None:
         },
     )
 
-    async def run(seq_id: int, loss_fn: str = "cross_entropy") -> None:
+    async def run(seq_id: int, loss_fn: types.LossFnType = "cross_entropy") -> None:
         config = {"raise_missing_input": 1.0} if loss_fn == "importance_sampling" else None
         await state.run_forward(
             training.training_run_id,
@@ -522,6 +524,75 @@ async def test_load_checkpoint_restores_state(request, tmp_path) -> None:
             training.training_run_id, path=ckpt_path, user_id="wrong_user", optimizer=True
         )
     assert "Access to checkpoint restore-test is denied." in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_load_checkpoint_into_new_run_targets_caller(request, tmp_path) -> None:
+    """Resume flow: a fresh training run loading a checkpoint from another run
+    must receive the weights itself (create_training_client_from_state
+    semantics), not push them back into the checkpoint's source run."""
+    use_gpu = request.config.getoption("--gpu")
+    state = await _build_state(tmp_path, use_gpu)
+    session_id = _create_session(state)
+    source = await state.create_model(
+        session_id,
+        model_owner="tester",
+        base_model="Qwen/Qwen3-0.6B",
+        lora_config=types.LoraConfig(rank=4),
+        user_metadata=None,
+    )
+    datum = types.Datum(
+        model_input=types.ModelInput.from_ints([3, 4, 5, 6]),
+        loss_fn_inputs={
+            "target_tokens": types.TensorData(data=[7, 8, 9, 10], dtype="int64", shape=[4]),
+            "weights": types.TensorData(data=[1.0] * 4, dtype="float32", shape=[4]),
+        },
+    )
+    await state.run_forward(
+        source.training_run_id,
+        user_id="tester",
+        data=[datum],
+        loss_fn="cross_entropy",
+        loss_fn_config=None,
+        seq_id=None,
+        backward=True,
+    )
+    checkpoint = await state.save_checkpoint(
+        source.training_run_id,
+        user_id="tester",
+        name="resume-src",
+        checkpoint_type="training",
+    )
+    ckpt_path = checkpoint.tinker_checkpoint.tinker_path
+
+    # New run (what the SDK creates before load_state)
+    target = await state.create_model(
+        session_id,
+        model_owner="tester",
+        base_model="Qwen/Qwen3-0.6B",
+        lora_config=types.LoraConfig(rank=4),
+        user_metadata=None,
+    )
+    assert target.training_run_id != source.training_run_id
+
+    # Record which lora_id the backend is asked to load into.
+    backend = state.training.training_backends["Qwen/Qwen3-0.6B"]
+    load_calls: list[str] = []
+    original_load_state = backend.load_state
+
+    async def _spy_load_state(lora_id, checkpoint_record, optimizer):
+        load_calls.append(lora_id)
+        return await original_load_state(lora_id, checkpoint_record, optimizer)
+
+    backend.load_state = _spy_load_state
+
+    await state.load_checkpoint(
+        target.training_run_id, path=ckpt_path, user_id="tester", optimizer=True
+    )
+
+    assert load_calls == [target.training_run_id], (
+        f"weights must load into the caller's run, got {load_calls}"
+    )
 
 
 @pytest.mark.asyncio
