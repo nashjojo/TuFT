@@ -349,14 +349,28 @@ class TrainingController:
                 f"cannot create a '{requested_mode}' training run."
             )
         if requested_mode == "full_param":
-            existing_full_runs = [
-                record.training_run_id
-                for record in self.training_runs.values()
-                if record.training_mode == "full_param" and record.model_owner == model_owner
-            ]
-            if existing_full_runs and model_id not in existing_full_runs:
-                raise ValueError(
-                    f"Only one full-param run is supported; {existing_full_runs[0]} already exists."
+            # One shared full-param model and optimizer means only one run can be
+            # bound at a time. A resumed client arrives under a new session and
+            # the SDK derives model_id from it, so it can never reuse the
+            # existing run's id; release the previous binding and let the new run
+            # take the slot. The old record stays registered because
+            # load_checkpoint resolves checkpoints from the training_run_id
+            # encoded in the tinker:// path, so the new run can still load it.
+            for record in self.training_runs.values():
+                if record.training_mode != "full_param" or record.model_owner != model_owner:
+                    continue
+                if record.training_run_id == model_id:
+                    continue
+                if record.backend is not None:
+                    # release_run is FSDP-specific, not part of the base contract.
+                    release = getattr(record.backend, "release_run", None)
+                    if release is not None:
+                        release(record.training_run_id)
+                record.backend = None
+                logger.info(
+                    "Released full-param run %s so %s can take the single slot",
+                    record.training_run_id,
+                    model_id,
                 )
         with _get_tracer().start_as_current_span("training_controller.create_model") as span:
             span.set_attribute("tuft.training_run_id", model_id)

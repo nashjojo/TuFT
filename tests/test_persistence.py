@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -11,6 +14,8 @@ from tinker import types
 from tinker.types.try_again_response import TryAgainResponse
 
 from tuft.auth import User
+from tuft.backends.base_backend import BaseTrainingBackend
+from tuft.checkpoints import CheckpointRecord
 from tuft.config import AppConfig, ModelConfig, TelemetryConfig
 from tuft.exceptions import ConfigMismatchError, TuFTException, UnknownModelException
 from tuft.futures import FutureStore
@@ -1126,3 +1131,150 @@ class TestConfigSignatureValidation:
         error = exc_info.value
         assert "_state" in error.diff
         assert "missing signature" in str(error).lower() or "corrupted" in str(error).lower()
+
+
+class _RecordingBackend:
+    """Stub backend that records which adapter and checkpoint calls were made."""
+
+    def __init__(self) -> None:
+        self.created: list[str] = []
+        self.loaded: list[tuple[str, str, bool]] = []
+        self.released: list[str] = []
+
+    async def create_adapter(self, adapter_name: str, lora_config: object) -> None:
+        self.created.append(adapter_name)
+
+    async def load_state(
+        self, lora_id: str, checkpoint_record: CheckpointRecord, optimizer: bool = False
+    ) -> None:
+        self.loaded.append((lora_id, checkpoint_record.checkpoint_id, optimizer))
+
+    def release_run(self, run_id: str) -> None:
+        self.released.append(run_id)
+
+
+def _make_checkpoint(app_config, run_id, ckpt_id, ckpt_type, created_at):
+    return CheckpointRecord(
+        checkpoint_id=ckpt_id,
+        owner_name="tester",
+        checkpoint_type=ckpt_type,
+        training_run_id=run_id,
+        path=app_config.checkpoint_dir / run_id / ckpt_id,
+        size_bytes=1024,
+        created_at=created_at,
+        training_mode="full_param",
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_param_restore_reports_the_checkpoint_it_loaded(tmp_path):
+    """A newer sampler checkpoint must not be reported as the resume point.
+
+    Only training checkpoints are loadable in full-param mode; sampler
+    checkpoints are HF model dirs, not distributed-checkpoint state.
+    """
+    app_config = _create_test_config(tmp_path / "checkpoints")
+    controller = TrainingController(app_config)
+    run_id = "full-param-run"
+    backend = _RecordingBackend()
+
+    record = TrainingRunRecord(
+        training_run_id=run_id,
+        base_model="Qwen/Qwen3-0.6B",
+        lora_rank=16,
+        session_id="session-fp",
+        model_owner="tester",
+        training_mode="full_param",
+    )
+    record.backend = cast(Any, backend)
+    record.checkpoints["state-3"] = _make_checkpoint(
+        app_config, run_id, "state-3", "training", datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    record.checkpoints["state-9"] = _make_checkpoint(
+        app_config, run_id, "state-9", "training", datetime(2026, 1, 2, tzinfo=timezone.utc)
+    )
+    # Newer than both training checkpoints.
+    record.sampler_checkpoints["sampler-8"] = _make_checkpoint(
+        app_config, run_id, "sampler-8", "sampler", datetime(2026, 1, 3, tzinfo=timezone.utc)
+    )
+    controller.training_runs[run_id] = record
+
+    restored = await controller.restore_from_checkpoint(run_id)
+
+    assert restored is not None
+    assert restored.checkpoint_id == "state-9"
+    assert backend.loaded == [(run_id, "state-9", True)]
+    assert backend.created == [run_id]
+
+
+@pytest.mark.asyncio
+async def test_full_param_restore_without_training_checkpoint_returns_none(tmp_path):
+    app_config = _create_test_config(tmp_path / "checkpoints")
+    controller = TrainingController(app_config)
+    run_id = "full-param-run-no-ckpt"
+    backend = _RecordingBackend()
+
+    record = TrainingRunRecord(
+        training_run_id=run_id,
+        base_model="Qwen/Qwen3-0.6B",
+        lora_rank=16,
+        session_id="session-fp",
+        model_owner="tester",
+        training_mode="full_param",
+    )
+    record.backend = cast(Any, backend)
+    record.sampler_checkpoints["sampler-8"] = _make_checkpoint(
+        app_config, run_id, "sampler-8", "sampler", datetime(2026, 1, 3, tzinfo=timezone.utc)
+    )
+    controller.training_runs[run_id] = record
+
+    assert await controller.restore_from_checkpoint(run_id) is None
+    assert backend.loaded == []
+
+
+@pytest.mark.asyncio
+async def test_full_param_create_releases_the_previous_run(tmp_path, monkeypatch):
+    """A resumed client arrives under a new session, so it gets a new model_id.
+
+    Only one full-param run can hold the shared model and optimizer, so the
+    previous run gives up its binding. It stays registered, because
+    load_checkpoint resolves checkpoints from the run encoded in the path.
+    """
+    monkeypatch.setenv("TUFT_TRAINING_MODE", "full_param")
+    app_config = _create_test_config(tmp_path / "checkpoints")
+    controller = TrainingController(app_config)
+
+    base_model = "Qwen/Qwen3-0.6B"
+    # TrainingRunRecord validates backend with isinstance, so the mock needs the
+    # real class as its spec.
+    backend = MagicMock(spec=BaseTrainingBackend)
+    backend.create_adapter = AsyncMock()
+    backend.release_run = MagicMock()
+    controller.training_backends[base_model] = backend
+
+    old_record = TrainingRunRecord(
+        training_run_id="old-run",
+        base_model=base_model,
+        lora_rank=16,
+        session_id="session-old",
+        model_owner="tester",
+        training_mode="full_param",
+    )
+    old_record.backend = backend
+    controller.training_runs["old-run"] = old_record
+
+    new_record = await controller.create_model(
+        session_id="session-new",
+        base_model=base_model,
+        lora_config=types.LoraConfig(rank=16),
+        model_owner="tester",
+        user_metadata={"training_mode": "full_param"},
+        model_id="new-run",
+    )
+
+    backend.release_run.assert_called_once_with("old-run")
+    assert old_record.backend is None
+    assert "old-run" in controller.training_runs
+    assert new_record.training_run_id == "new-run"
+    assert new_record.training_mode == "full_param"
+    backend.create_adapter.assert_awaited_once_with("new-run", types.LoraConfig(rank=16))
