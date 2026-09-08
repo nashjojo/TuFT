@@ -206,3 +206,23 @@ async def test_future_id_counter_survives_restart():
         assert restarted.get_current_future_id() > first_id
     finally:
         await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_completed_future_is_evicted_after_retrieve():
+    """Nothing calls cleanup(), so retrieve has to free the record itself."""
+    store = FutureStore()
+
+    def _operation() -> types.SaveWeightsResponse:
+        return types.SaveWeightsResponse(path="tinker://run/weights/ckpt")
+
+    future = await store.enqueue(_operation, model_id="run", user_id="tester")
+    result = await _wait_for_result(store, future.request_id, user_id="tester")
+    assert isinstance(result, types.SaveWeightsResponse)
+    assert future.request_id not in store._records
+
+    # Redis keeps it for its TTL, so a repeat poll still works.
+    again = await store.retrieve(future.request_id, user_id="tester", timeout=0.1)
+    assert again["path"] == "tinker://run/weights/ckpt"
+
+    await store.shutdown()

@@ -480,6 +480,13 @@ class FutureStore:
         if record.status == "failed" and record.error is not None:
             raise record.error
 
+        if not restored:
+            # Nothing calls cleanup(), so completed futures would otherwise stay
+            # in memory for the life of the process. Redis keeps them for their
+            # TTL, so a repeat poll reloads it on the lazy path.
+            async with self._lock:
+                self._records.pop(request_id, None)
+
         return record.payload
 
     async def cleanup(self, request_id: str) -> None:
