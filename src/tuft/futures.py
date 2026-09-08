@@ -108,37 +108,49 @@ class FutureStore:
     """Runs controller work asynchronously and tracks each request's lifecycle."""
 
     REDIS_KEY_PREFIX = "future"
+    REDIS_COUNTER_PREFIX = "future_counter"
 
     def __init__(self) -> None:
         self._records: dict[str, FutureRecord] = {}
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
         self._next_future_id: int = 1
-        self._restore_from_redis()
+        self._restore_future_id_counter()
 
     def _build_key(self, request_id: str) -> str:
         return get_redis_store().build_key(self.REDIS_KEY_PREFIX, request_id)
 
-    def _restore_from_redis(self) -> None:
+    def _build_counter_key(self) -> str:
+        return get_redis_store().build_key(self.REDIS_COUNTER_PREFIX, "next_id")
+
+    def _restore_future_id_counter(self) -> None:
+        """Restore the future_id counter only.
+
+        Futures themselves are loaded on demand by request_id; restoring them
+        all at startup was what made restarts take unbounded time.
+        """
         if not is_persistence_enabled():
             return
-        store = get_redis_store()
-        pattern = store.build_key(self.REDIS_KEY_PREFIX, "*")
-        for key in store.keys(pattern):
-            record = load_record(key, FutureRecord)
-            if record is None:
-                # Record may have expired (TTL) or failed to deserialize
-                # This is expected for expired futures, just skip them
-                continue
-            if record.status != "pending":
-                record.event.set()
-            self._records[record.request_id] = record
-            if record.future_id >= self._next_future_id:
-                self._next_future_id = record.future_id + 1
+        raw = get_redis_store().get(self._build_counter_key())
+        if raw is None:
+            return
+        try:
+            self._next_future_id = int(raw)
+        except ValueError:
+            logger.warning("Ignoring corrupt future id counter %r", raw)
+
+    def _persist_future_id_counter(self) -> None:
+        if not is_persistence_enabled():
+            return
+        get_redis_store().set(self._build_counter_key(), str(self._next_future_id))
+
+    def _load_future_from_redis(self, request_id: str) -> FutureRecord | None:
+        return load_record(self._build_key(request_id), FutureRecord)
 
     def _save_future(self, request_id: str) -> None:
         if not is_persistence_enabled():
             return
+        self._persist_future_id_counter()
         record = self._records.get(request_id)
         if record is not None:
             # Use TTL for futures to prevent Redis from growing indefinitely
@@ -440,12 +452,22 @@ class FutureStore:
         async with self._lock:
             record = self._records.get(request_id)
 
+        restored = record is None
+        if restored:
+            # Futures from before a restart live in Redis only, so fetch them on
+            # demand rather than holding every one in memory.
+            record = self._load_future_from_redis(request_id)
         if record is None:
             # Record not found - may have expired due to TTL or never existed
             raise FutureNotFoundException(request_id)
         if record.user_id != user_id:
             record.status = "failed"
             raise UserMismatchException()
+        if restored and record.status == "pending":
+            # Its work died with the previous process; nothing can complete it.
+            raise FutureCancelledException(
+                request_id, reason="Server restarted while task was pending. Please retry."
+            )
         # Wait for completion if still pending
         if record.status == "pending":
             try:

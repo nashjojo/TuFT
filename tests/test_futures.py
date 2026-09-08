@@ -136,3 +136,73 @@ async def test_mark_pending_sample_futures_failed():
     assert isinstance(training_result, TryAgainResponse)
 
     await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_completed_future_is_retrievable_after_restart():
+    """Completed futures are loaded from Redis on demand, not restored eagerly."""
+    store = FutureStore()
+    future = await store.create_ready_future(
+        types.SaveWeightsResponse(path="tinker://run/weights/ckpt"),
+        user_id="tester",
+        model_id="run",
+    )
+    await store.shutdown()
+
+    restarted = FutureStore()
+    try:
+        result = await restarted.retrieve(future.request_id, user_id="tester", timeout=0.1)
+        # Redis round-trips the payload as JSON, so it comes back as a dict;
+        # the HTTP layer passes dicts through unchanged, giving the same
+        # response body as a live future.
+        assert result["path"] == "tinker://run/weights/ckpt"
+    finally:
+        await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_future_from_previous_process_is_failed():
+    """A pending future outlived its process, so nothing can ever complete it."""
+    from tuft.futures import FutureRecord
+    from tuft.persistence import get_redis_store, save_record
+
+    stale = FutureRecord(
+        request_id="stale-request",
+        future_id=1,
+        user_id="tester",
+        status="pending",
+        operation_type="sample",
+    )
+    key = get_redis_store().build_key(FutureStore.REDIS_KEY_PREFIX, "stale-request")
+    save_record(key, stale)
+
+    store = FutureStore()
+    try:
+        with pytest.raises(FutureCancelledException):
+            await store.retrieve("stale-request", user_id="tester", timeout=0.1)
+    finally:
+        await store.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_future_id_counter_survives_restart():
+    """IDs stay monotonic across restarts without scanning every future."""
+    store = FutureStore()
+    await store.create_ready_future(
+        types.SaveWeightsResponse(path="tinker://run/weights/ckpt"),
+        user_id="tester",
+        model_id="run",
+    )
+    first_id = store.get_current_future_id()
+    await store.shutdown()
+
+    restarted = FutureStore()
+    try:
+        await restarted.create_ready_future(
+            types.SaveWeightsResponse(path="tinker://run/weights/ckpt2"),
+            user_id="tester",
+            model_id="run",
+        )
+        assert restarted.get_current_future_id() > first_id
+    finally:
+        await restarted.shutdown()

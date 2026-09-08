@@ -12,7 +12,7 @@ from tinker.types.try_again_response import TryAgainResponse
 
 from tuft.auth import User
 from tuft.config import AppConfig, ModelConfig, TelemetryConfig
-from tuft.exceptions import ConfigMismatchError, UnknownModelException
+from tuft.exceptions import ConfigMismatchError, TuFTException, UnknownModelException
 from tuft.futures import FutureStore
 from tuft.persistence import (
     ConfigCheckField,
@@ -209,10 +209,11 @@ class TestFutureStorePersistence:
 
         # === Phase 3: Server restart ===
         new_store = FutureStore()
-        record = new_store._records.get(request_id)
-        assert record is not None
-        assert record.status == "ready"
-        assert record.payload is not None
+        # Futures are loaded on demand now rather than restored into _records,
+        # so assert the client-visible contract. Redis round-trips the payload
+        # as JSON, so it comes back as a dict.
+        result = await new_store.retrieve(request_id, user_id="tester", timeout=0.1)
+        assert result["path"].endswith("ckpt")
 
         await new_store.shutdown()
 
@@ -239,10 +240,11 @@ class TestFutureStorePersistence:
 
         # === Phase 3: Server restart ===
         new_store = FutureStore()
-        record = new_store._records.get(request_id)
-        assert record is not None
-        assert record.status == "failed"
-        assert record.error is not None
+        # Futures are loaded on demand now rather than restored into _records.
+        # The failure still reaches the client; the exception type may not
+        # survive the JSON round-trip, so assert on the base class.
+        with pytest.raises(TuFTException):
+            await new_store.retrieve(request_id, user_id="tester", timeout=0.1)
 
         await new_store.shutdown()
 
