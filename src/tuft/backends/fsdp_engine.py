@@ -74,7 +74,11 @@ def build_base_model(config: FSDPModelConfig) -> Any:
 
     model_kwargs: dict[str, Any] = {
         "config": hf_config,
-        "dtype": torch.bfloat16,
+        # fp32 master weights: with bf16 parameters AdamW's moments are bf16 too,
+        # and a step at lr=1e-5 is ~10x smaller than the bf16 ulp for weights of
+        # magnitude ~0.027, so updates round away and training stalls. FSDP2's
+        # MixedPrecisionPolicy still casts to bf16 for compute.
+        "dtype": torch.float32,
         "low_cpu_mem_usage": True,
         "trust_remote_code": config.trust_remote_code,
     }
@@ -148,25 +152,23 @@ def _compute_target_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torc
     unlike log_softmax, which saves its entire output.
     """
 
-    _CHUNK = 8192
+    _CHUNK = 1024
 
     flat_logits = logits.reshape(-1, logits.size(-1))
     flat_labels = labels.reshape(-1)
     out = torch.empty(flat_labels.shape, dtype=torch.float32, device=logits.device)
     for start in range(0, flat_logits.size(0), _CHUNK):
         end = start + _CHUNK
-        chunk = flat_logits[start:end]
-        # Run outside autocast: autocast promotes logsumexp to fp32, which
-        # materializes a logits-sized fp32 copy per chunk (and its backward
-        # allocates another fp32 chunk-sized temp), reintroducing the very
-        # OOM this chunking exists to avoid. Outside autocast, gather and
-        # logsumexp save only bf16 views plus tiny outputs for backward.
+        # Both ops must run in fp32: bf16 logsumexp over a ~152k-token vocab
+        # loses precision in the log-softmax. The small chunk keeps the single
+        # fp32 copy at ~622 MiB instead of a logits-sized tensor.
+        chunk = flat_logits[start:end].float()
         with torch.autocast(device_type="cuda", enabled=False):
             label_logits = torch.gather(
                 chunk, dim=-1, index=flat_labels[start:end].unsqueeze(-1)
             ).squeeze(-1)
             logsumexp = torch.logsumexp(chunk, dim=-1)
-        out[start:end] = label_logits.float() - logsumexp.float()
+        out[start:end] = label_logits - logsumexp
     return out.view(labels.shape)
 
 
@@ -272,8 +274,15 @@ def forward_backward(
     micro_batch_size: int,
     *,
     forward_only: bool = False,
+    replicated: bool = False,
 ) -> dict[str, Any]:
-    """Run contiguous micro-batches while preserving summed gradient accumulation."""
+    """Run contiguous micro-batches while preserving summed gradient accumulation.
+
+    ``replicated``: every rank received the identical full batch (used when
+    len(data) < world_size so no rank idles in FSDP-2 collectives). Per-rank
+    gradients are identical, so the reduce-scatter average already equals the
+    full-batch gradient — the world_size loss compensation must be skipped.
+    """
 
     if not data:
         return {"model_output": {"log_probs": []}, "metrics": {}}
@@ -321,8 +330,11 @@ def forward_backward(
                 # single-GPU / HF value, silently rescaling the effective learning
                 # rate whenever the GPU count changes. Multiply back by world_size so
                 # the reduced gradient equals the full-batch sum gradient.
+                # Exception: replicated mode — every rank holds the SAME full batch,
+                # so the average of identical gradients already IS the full-batch
+                # gradient; compensating would scale it by world_size.
                 world_size = _fsdp_world_size()
-                if world_size > 1:
+                if world_size > 1 and not replicated:
                     (loss * world_size).backward()
                 else:
                     loss.backward()
