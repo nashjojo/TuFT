@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple, cast
 
 from opentelemetry.trace import StatusCode
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
@@ -325,8 +325,20 @@ class SamplingController:
                         raise UnknownModelException(model_name=base_model_ref)
                     sampling_backend = self._base_backends[base_model_ref]
                     active_id = getattr(sampling_backend, "get_active_deployment_id", None)
-                    if callable(active_id) and active_id() is not None:
-                        raise CheckpointAccessDeniedException(checkpoint_id="base-model")
+                    deployed = cast(Optional[str], active_id()) if callable(active_id) else None
+                    if deployed is not None:
+                        # Full weights are live, so a base-model session samples the
+                        # deployed policy rather than the pristine base model. That is
+                        # what a resumed run wants: it asks for "the current policy"
+                        # through a base-model client before deploying its own
+                        # checkpoint, so refusing here would deadlock resume. Refuse
+                        # only for weights from a run this server no longer knows.
+                        deployed_run = types.ParsedCheckpointTinkerPath.from_tinker_path(
+                            deployed
+                        ).training_run_id
+                        known_runs = getattr(self._training_controller, "training_runs", None)
+                        if known_runs is not None and deployed_run not in known_runs:
+                            raise CheckpointAccessDeniedException(checkpoint_id="base-model")
                     checkpoint_mode = "lora"
                 else:
                     raise UnknownModelException(model_name="None")
