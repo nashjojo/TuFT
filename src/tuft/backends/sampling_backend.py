@@ -339,10 +339,19 @@ class VLLMSamplingBackend(BaseSamplingBackend):
             lora_request = self.lora_adapters[lora_id] if lora_id is not None else None
 
         prompt_token_ids = prompt.to_ints()
+        # A prompt-logprob request needs no generated tokens, but vLLM still
+        # requires at least one. Defaulting to 16 made it demand
+        # prompt_len + 16 <= max_model_len, rejecting any prompt longer than
+        # max_model_len - 16; 1 keeps the usable window at max_model_len - 1 and
+        # avoids generating 16 tokens that are thrown away.
+        if sampling_params.max_tokens is not None:
+            max_tokens = sampling_params.max_tokens
+        elif include_prompt_logprobs:
+            max_tokens = 1
+        else:
+            max_tokens = 16
         params = {
-            "max_tokens": (
-                sampling_params.max_tokens if sampling_params.max_tokens is not None else 16
-            ),
+            "max_tokens": max_tokens,
             "seed": sampling_params.seed,
             "top_k": sampling_params.top_k,
             "top_p": sampling_params.top_p,
