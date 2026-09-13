@@ -74,6 +74,15 @@ class ModelConfig(BaseModel):
     # divisibility check, so all ranks still run the same micro-batch count
     # (NCCL collective symmetry is preserved).
     micro_batch_tokens: int | None = None
+    # Whether the FSDP training model enables HF gradient checkpointing
+    # (activation recompute during backward: ~+1/3 forward FLOPs for much lower
+    # activation memory). Set false to trade memory back for speed when the
+    # micro-batch activations fit without recompute.
+    fsdp_gradient_checkpointing: bool = True
+    # Partial checkpointing: keep the last N decoder layers uncheckpointed
+    # (activations persist there, earlier layers still recompute). Middle ground
+    # between full checkpointing and the memory-risky full-off variant.
+    fsdp_checkpoint_skip_layers: int = 0
     # training backend: "hf" (HFTrainingBackend) or "fsdp" (FSDPTrainingBackend)
     training_backend: Literal["hf", "fsdp"] = "hf"
     training_mode: str = Field(default="lora", exclude=True)

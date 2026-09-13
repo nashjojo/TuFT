@@ -8,6 +8,9 @@ and distributed orchestration remain in :mod:`fsdp_training_backend`.
 
 from __future__ import annotations
 
+import logging
+import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,6 +24,8 @@ from tuft.loss_fn import get_loss_fn
 
 
 _RLHF_LOSS_FNS = {"ppo", "grpo", "cispo", "importance_sampling", "dro"}
+
+logger = logging.getLogger(__name__)
 
 
 def _fsdp_world_size() -> int:
@@ -40,6 +45,8 @@ class FSDPModelConfig:
     attn_implementation: str | None = None
     override_config: dict[str, Any] = field(default_factory=dict)
     trust_remote_code: bool = True
+    gradient_checkpointing: bool = True
+    checkpoint_skip_layers: int = 0
 
 
 @dataclass
@@ -87,7 +94,26 @@ def build_base_model(config: FSDPModelConfig) -> Any:
 
     model = AutoModelForCausalLM.from_pretrained(config.path, **model_kwargs)
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable({"use_reentrant": False})
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable({"use_reentrant": False})
+        # Optional partial checkpointing: uncheckpoint the LAST N decoder layers
+        # (their activations persist; earlier layers still recompute). Trades
+        # some activation memory for a fraction of the recompute FLOPs — the
+        # full-OFF variant OOMs at real ALFWorld micro-batch sizes, this is the
+        # tunable middle ground. A diagnostic flag file overrides the config so
+        # fractions can be swept without a server restart.
+        skip = config.checkpoint_skip_layers
+        skip_file = "/tmp/tuft_fsdp_skip_ckpt_layers"
+        if os.path.exists(skip_file):
+            try:
+                with open(skip_file) as fh:
+                    skip = int(fh.read().strip() or "0")
+            except (OSError, ValueError):
+                pass
+        layers = getattr(getattr(model, "model", None), "layers", None)
+        if skip > 0 and layers is not None:
+            for layer in list(layers)[-skip:]:
+                layer.gradient_checkpointing = False
     return model
 
 
@@ -248,6 +274,30 @@ def _prepare_loss_fn_inputs(
     return {"target_logprobs": target_logprobs, "weights": weights}
 
 
+def _equal_count_pieces(data: list[types.Datum], num_pieces: int) -> list[list[types.Datum]]:
+    """Split data into ``num_pieces`` contiguous equal-datum-count pieces.
+
+    Equal COUNT (not equal tokens) is deliberate: clients send length-sorted
+    batches, so contiguous equal-count pieces stay length-homogeneous and pad
+    only to each piece's own maximum. Equal token loads across ranks are already
+    handled one level up by token-balanced sharding; this only controls
+    per-rank padding and memory.
+    """
+
+    if num_pieces <= 1 or len(data) <= 1:
+        return [list(data)]
+    n = len(data)
+    base = n // num_pieces
+    rem = n % num_pieces
+    pieces = []
+    start = 0
+    for i in range(num_pieces):
+        size = base + (1 if i < rem else 0)
+        pieces.append(data[start : start + size])
+        start += size
+    return pieces
+
+
 def _merge_micro_metrics(metric_list: list[dict[str, Any]]) -> dict[str, float]:
     """Combine numeric micro-batch metrics using their declared reduction."""
 
@@ -275,6 +325,7 @@ def forward_backward(
     *,
     forward_only: bool = False,
     replicated: bool = False,
+    num_pieces: int | None = None,
 ) -> dict[str, Any]:
     """Run contiguous micro-batches while preserving summed gradient accumulation.
 
@@ -282,6 +333,11 @@ def forward_backward(
     len(data) < world_size so no rank idles in FSDP-2 collectives). Per-rank
     gradients are identical, so the reduce-scatter average already equals the
     full-batch gradient — the world_size loss compensation must be skipped.
+
+    ``num_pieces``: when set (>1), this rank splits its shard into that many
+    contiguous token-balanced pieces instead of datum-count micro-batches. The
+    backend passes one shared piece count to every rank, keeping FSDP-2
+    collective rounds symmetric while equalizing per-round token volume.
     """
 
     if not data:
@@ -295,16 +351,52 @@ def forward_backward(
     per_sample_logprobs: list[torch.Tensor] = []
     metric_list: list[dict[str, Any]] = []
 
+    # Diagnostic gate for the bwd-split study: a flag file (or env var) turns on
+    # a chrome trace for this call, exported to $TUFT_FSDP_PROFILE_OUT_<pid>_<ts>.
+    profiler = None
+    if os.environ.get("TUFT_FSDP_PROFILE") == "1" or os.path.exists("/tmp/tuft_fsdp_profile_on"):
+        import torch.profiler as torch_profiler
+
+        profiler = torch_profiler.profile(
+            activities=[torch_profiler.ProfilerActivity.CPU, torch_profiler.ProfilerActivity.CUDA],
+            record_shapes=True,
+        )
+        profiler.start()
+
+    t_call = time.perf_counter()
+    prep_s = fwd_s = loss_s = bwd_s = 0.0
+    real_tokens = 0
+    padded_tokens = 0
+
+    if num_pieces and num_pieces > 1:
+        if num_pieces > len(data):
+            # Every rank must run the same piece count or FSDP-2 collectives
+            # deadlock; never silently drop pieces. Cannot happen while each
+            # datum is <= micro_batch_tokens (num_pieces is derived from the
+            # token budget), so fail loudly on a misconfigured combination.
+            raise ValueError(
+                f"num_pieces={num_pieces} exceeds datum count {len(data)}; "
+                "check micro_batch_tokens against the longest datum"
+            )
+        micro_batches: list[list[types.Datum]] = _equal_count_pieces(data, num_pieces)
+    else:
+        micro_batches = [
+            data[start : start + micro_batch_size]
+            for start in range(0, len(data), micro_batch_size)
+        ]
+
     grad_context = torch.no_grad() if forward_only else nullcontext()
     with grad_context:
-        for start in range(0, len(data), micro_batch_size):
-            micro_data = data[start : start + micro_batch_size]
+        for micro_data in micro_batches:
+            t_phase = time.perf_counter()
             batch = _prepare_micro_batch(micro_data, device)
+            prep_s += time.perf_counter() - t_phase
             autocast = torch.autocast(
                 device_type="cuda",
                 dtype=torch.bfloat16,
                 enabled=device.type == "cuda",
             )
+            t_phase = time.perf_counter()
             with autocast:
                 outputs = module(
                     input_ids=batch.input_ids,
@@ -320,10 +412,14 @@ def forward_backward(
                 if "temperature" in config and config["temperature"]:
                     logits = logits / config["temperature"]
                 target_logprobs = _compute_target_logprobs(logits, batch.labels)
+            fwd_s += time.perf_counter() - t_phase
 
+            t_phase = time.perf_counter()
             loss_inputs = _prepare_loss_fn_inputs(micro_data, target_logprobs, loss_fn_name)
             loss, metrics = loss_callable(loss_inputs, config)
+            loss_s += time.perf_counter() - t_phase
             if not forward_only:
+                t_phase = time.perf_counter()
                 # FSDP2 `fully_shard` averages gradients across ranks during the
                 # reduce-scatter, but our loss functions are sum-reductions. Without
                 # compensation the effective gradient is 1/world_size of the
@@ -338,12 +434,57 @@ def forward_backward(
                     (loss * world_size).backward()
                 else:
                     loss.backward()
+                bwd_s += time.perf_counter() - t_phase
             metric_list.append(metrics)
             per_sample_logprobs.extend(
                 target_logprobs[row, :length].detach() for row, length in enumerate(batch.lengths)
             )
+            real_tokens += sum(batch.lengths)
+            padded_tokens += int(batch.input_ids.numel())
+
+    total_s = time.perf_counter() - t_call
+    n_micro = len(micro_batches)
+    pad_ratio = (padded_tokens - real_tokens) / padded_tokens if padded_tokens else 0.0
+    if profiler is not None:
+        profiler.stop()
+        out = os.environ.get("TUFT_FSDP_PROFILE_OUT", "/tmp/tuft_fsdp_prof")
+        path = f"{out}_{os.getpid()}_{int(time.time())}.json"
+        try:
+            profiler.export_chrome_trace(path)
+            logger.info("[fsdp-profile] trace exported: %s", path)
+        except Exception:  # noqa: BLE001 - diagnostics must never break training
+            logger.exception("[fsdp-profile] trace export failed")
+    logger.info(
+        "[fsdp-timing] backward=%s batch=%d micros=%d real_tok=%d padded_tok=%d "
+        "pad_ratio=%.3f prep=%.3fs fwd=%.3fs loss=%.3fs bwd=%.3fs total=%.3fs",
+        not forward_only,
+        len(data),
+        n_micro,
+        real_tokens,
+        padded_tokens,
+        pad_ratio,
+        prep_s,
+        fwd_s,
+        loss_s,
+        bwd_s,
+        total_s,
+    )
+    # Ship timings through the return value as well: worker stdout forwarding is
+    # unreliable (some actors' lines never reach the driver log), while the
+    # ray.get result path always works. The backend logs these and strips them
+    # before the metrics reach the client, so the client surface is unchanged.
+    metrics_out = _merge_micro_metrics(metric_list)
+    metrics_out["timing/prep:mean"] = prep_s
+    metrics_out["timing/fwd:mean"] = fwd_s
+    metrics_out["timing/loss:mean"] = loss_s
+    metrics_out["timing/bwd:mean"] = bwd_s
+    metrics_out["timing/total:mean"] = total_s
+    metrics_out["timing/pad_ratio:mean"] = pad_ratio
+    metrics_out["timing/real_tokens:sum"] = float(real_tokens)
+    metrics_out["timing/padded_tokens:sum"] = float(padded_tokens)
+    metrics_out["timing/micro_batches:sum"] = float(n_micro)
 
     return {
         "model_output": {"log_probs": per_sample_logprobs},
-        "metrics": _merge_micro_metrics(metric_list),
+        "metrics": metrics_out,
     }

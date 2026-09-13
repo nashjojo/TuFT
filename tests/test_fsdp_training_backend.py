@@ -573,6 +573,69 @@ def test_shard_list_more_shards_than_elements():
     assert reconstructed == data
 
 
+def test_uniform_micro_batch_size_single_round_when_all_shards_fit():
+    """Shards that fit within max_mb use the single-round fallback (None)."""
+    from tuft.backends.fsdp_training_backend import _uniform_micro_batch_size
+
+    # All shards <= cap: None means one whole-shard micro-batch per rank
+    # (count 1, one collective round) instead of a forced smaller mb with
+    # extra rounds. The token budget that produced max_mb still bounds it.
+    assert _uniform_micro_batch_size([3, 3, 3, 3], 4) is None
+    assert _uniform_micro_batch_size([4, 4, 4, 3], 4) is None
+    assert _uniform_micro_batch_size([2, 2, 2, 2], 16) is None
+    # A shard exceeds the cap: keep the real split (fewest uniform rounds).
+    assert _uniform_micro_batch_size([5, 5, 4, 4], 4) == 3
+    assert _uniform_micro_batch_size([9, 9, 9, 8], 4) == 3
+    # Degenerate inputs keep the old fallbacks.
+    assert _uniform_micro_batch_size([], 4) is None
+    assert _uniform_micro_batch_size([2, 1], 0) is None
+
+
+def test_token_balanced_shards_equalize_tokens_and_preserve_order():
+    """Contiguous shards balance token totals on length-sorted data."""
+    from types import SimpleNamespace
+
+    from tuft.backends.fsdp_training_backend import _token_balanced_shards
+
+    def data(lens):
+        return [SimpleNamespace(model_input=SimpleNamespace(length=n)) for n in lens]
+
+    # Sorted ascending: equal-count sharding puts ~13k tok vs ~110k tok on the
+    # thin/fat ranks; token-balanced sharding must even that out.
+    d = data([445] * 27 + [2000] * 27 + [5000] * 27 + [8191] * 26)
+    shards = _token_balanced_shards(d, 4)
+    toks = [sum(x.model_input.length for x in s) for s in shards]
+    assert len(shards) == 4 and all(shards)
+    assert max(toks) / min(toks) <= 1.35, toks
+    # Contiguity: concatenating shards restores the input order.
+    assert [x for s in shards for x in s] == d
+    # Respects the one-datum-per-shard lower bound.
+    small = _token_balanced_shards(data([10, 20, 30]), 3)
+    assert [len(s) for s in small] == [1, 1, 1]
+
+
+def test_engine_equal_count_pieces_split_and_edge_cases():
+    """Engine-side piece split: exact count, non-empty, order-preserving."""
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    from tuft.backends.fsdp_engine import _equal_count_pieces
+
+    def data(lens) -> list[Any]:
+        return [SimpleNamespace(model_input=SimpleNamespace(length=n)) for n in lens]
+
+    d = data(list(range(100, 100 + 40)))  # 40 datums
+    pieces = _equal_count_pieces(cast(list, d), 4)
+    assert [len(p) for p in pieces] == [10, 10, 10, 10]
+    assert [x for p in pieces for x in p] == d
+    # Uneven split keeps the remainder in the leading pieces, never empty.
+    uneven = _equal_count_pieces(cast(list, d[:15]), 4)
+    assert [len(p) for p in uneven] == [4, 4, 4, 3]
+    # Single piece / single datum short-circuits.
+    assert _equal_count_pieces(cast(list, d), 1) == [d]
+    assert len(_equal_count_pieces(cast(list, data([7])), 3)) == 1
+
+
 def test_shard_list_batch_order_contract_with_variable_length_data():
     """Verify the batch-order contract: after shard+merge, zip(data, outputs) aligns.
 

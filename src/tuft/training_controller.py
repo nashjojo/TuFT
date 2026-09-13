@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+# How long an out-of-order request waits for its missing lower seq_ids before
+# falling back to the gap/fast-forward semantics (covers a client draining a
+# concurrent submission window; bounded so a lost request cannot stall a run).
+_SEQ_WAIT_TIMEOUT_S = 180.0
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -78,6 +84,8 @@ class TrainingRunRecord(BaseModel):
     backend: BaseTrainingBackend | None = Field(default=None, exclude=True)
     # Private attribute for execution lock (not a model field)
     _execution_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+    # Notifies seq_id waiters when next_seq_id advances (concurrent submissions)
+    _seq_cond: asyncio.Condition = PrivateAttr(default_factory=asyncio.Condition)
 
     def to_training_run(self) -> types.TrainingRun:
         training_checkpoint = self._latest_checkpoint(self.checkpoints)
@@ -306,6 +314,22 @@ class TrainingController:
         seq_id: int | None,
         operation: Callable[[], Awaitable[T]],
     ) -> T:
+        if seq_id is not None and seq_id > record.next_seq_id:
+            # Out-of-order arrival (e.g. a client submitting chunks concurrently)
+            # with missing lower seq_ids: wait for the predecessors so they can
+            # execute first. Without this, the fast path below fast-forwards past
+            # the gap and later rejects the late lower seq_ids as conflicts.
+            deadline = time.monotonic() + _SEQ_WAIT_TIMEOUT_S
+            async with record._seq_cond:
+                while seq_id > record.next_seq_id:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break  # fall through to the gap/fast-forward path
+                    try:
+                        await asyncio.wait_for(record._seq_cond.wait(), remaining)
+                    except asyncio.TimeoutError:
+                        break
+
         async with record._execution_lock:
             if seq_id is not None:
                 expected = record.next_seq_id
@@ -325,6 +349,8 @@ class TrainingController:
 
             if seq_id is not None:
                 record.next_seq_id += 1
+                async with record._seq_cond:
+                    record._seq_cond.notify_all()
             # Save the updated next_seq_id to Redis
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._save_training_run, record.training_run_id)
@@ -462,11 +488,14 @@ class TrainingController:
 
             logger.info("Forward/backward begin for %s", model_id)
             start_time = time.perf_counter()
+            t_op_start: float | None = None
 
             # Count total input tokens for metrics
             total_tokens = sum(len(datum.model_input.to_ints()) for datum in data)
 
             async def _operation() -> types.ForwardBackwardOutput:
+                nonlocal t_op_start
+                t_op_start = time.perf_counter()
                 if record.backend is None:
                     raise UnknownModelException(model_name=model_id)
                 result = await record.backend.forward(
@@ -482,11 +511,22 @@ class TrainingController:
 
             # Record tokens per second metric
             duration = time.perf_counter() - start_time
+            wait_s = (t_op_start - start_time) if t_op_start is not None else duration
+            exec_s = duration - wait_s
             if total_tokens > 0 and duration > 0:
                 tokens_per_second = total_tokens / duration
                 get_metrics().training_tokens_per_second.record(
                     tokens_per_second, {"base_model": record.base_model}
                 )
+            logger.info(
+                "[call-timing] backward=%s data=%d tokens=%d wait=%.3fs exec=%.3fs total=%.3fs",
+                backward,
+                len(data),
+                total_tokens,
+                wait_s,
+                exec_s,
+                duration,
+            )
 
             return result
 

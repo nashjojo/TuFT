@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
@@ -94,6 +95,33 @@ def _shard_list(xs: list[Any], n_shards: int) -> list[list[Any]]:
     return shards
 
 
+def _token_balanced_shards(data: list[Any], n_shards: int) -> list[list[Any]]:
+    """Split data into contiguous shards with near-equal token totals.
+
+    Equal-count contiguous sharding is badly skewed on length-sorted client
+    batches (the first shard gets the shortest datums), and the skewed ranks
+    then spin inside FSDP-2 all-gathers waiting for the heaviest rank — a
+    measured 1.9s of a 2.0s call in the thin ranks' NCCL kernels. Cutting on
+    the token prefix keeps every rank's compute comparable; contiguity keeps
+    the batch-order contract for output assembly.
+    """
+    if n_shards <= 1:
+        return [list(data)]
+    lengths = [datum.model_input.length for datum in data]
+    prefix = [0]
+    for length in lengths:
+        prefix.append(prefix[-1] + length)
+    total = prefix[-1]
+    cuts = [0]
+    for k in range(1, n_shards):
+        want = total * k / n_shards
+        lo = cuts[-1] + 1
+        hi = len(data) - (n_shards - k)
+        cuts.append(min(range(lo, hi + 1), key=lambda c: abs(prefix[c] - want)))
+    cuts.append(len(data))
+    return [data[cuts[t] : cuts[t + 1]] for t in range(n_shards)]
+
+
 def _uniform_micro_batch_size(shard_lens: list[int], max_mb: int) -> Optional[int]:
     """Largest micro-batch size <= ``max_mb`` giving every rank the same count.
 
@@ -110,6 +138,13 @@ def _uniform_micro_batch_size(shard_lens: list[int], max_mb: int) -> Optional[in
     """
     lens = [n for n in shard_lens if n > 0]
     if not lens or max_mb <= 0:
+        return None
+    if max(lens) <= max_mb:
+        # Every shard fits in one cap-sized micro-batch: the None fallback (one
+        # micro-batch per rank, count 1) is uniform and completes in a single
+        # collective round, while the search below would insist on a smaller mb
+        # with more rounds. The token budget that produced max_mb still bounds
+        # the whole-shard micro-batch, so this cannot violate the memory cap.
         return None
     for mb in range(min(max_mb, max(lens)), 0, -1):
         counts = {(n + mb - 1) // mb for n in lens}
@@ -260,6 +295,8 @@ def _config_to_worker_dict(config: ModelConfig) -> dict:
         "fsdp_override_config": dict(getattr(config, "fsdp_override_config", None) or {}),
         "attn_implementation": getattr(config, "attn_implementation", None),
         "training_mode": getattr(config, "training_mode", "lora"),
+        "gradient_checkpointing": bool(getattr(config, "fsdp_gradient_checkpointing", True)),
+        "checkpoint_skip_layers": int(getattr(config, "fsdp_checkpoint_skip_layers", 0) or 0),
         "slot_config": {
             "rank_slots": rank_slots,
             "lora_alpha_ratio": 2,
@@ -288,6 +325,8 @@ def _worker_dict_to_configs(config_dict: dict) -> tuple[FSDPModelConfig, SlotPoo
         max_model_len=int(config_dict["max_model_len"]),
         attn_implementation=attn_implementation,
         override_config=override,
+        gradient_checkpointing=bool(config_dict.get("gradient_checkpointing", True)),
+        checkpoint_skip_layers=int(config_dict.get("checkpoint_skip_layers", 0) or 0),
     )
     sc = config_dict.get("slot_config") or {}
     slot_config = SlotPoolConfig(
@@ -474,6 +513,7 @@ class MultiAdapterFSDPWorker:
         micro_batch_size: int,
         forward_only: bool = False,
         replicated: bool = False,
+        num_pieces: int | None = None,
     ) -> Dict[str, Any]:
         """Run forward/backward without stepping or clearing accumulated gradients.
 
@@ -504,6 +544,7 @@ class MultiAdapterFSDPWorker:
             micro_batch_size,
             forward_only=forward_only,
             replicated=replicated,
+            num_pieces=num_pieces,
         )
 
     def optim_step(
@@ -770,6 +811,15 @@ class FullParamFSDPWorker:
             raise RuntimeError(f"Full-param worker is bound to {self.bound_run_id}, not {run_id}.")
         self.optimizer = None
         self.step_count = 0
+        # A released run's accumulated gradients are dead state. Leaking them
+        # into whichever run binds next would (a) feed its first optim_step and
+        # (b) be folded into torch's _init_optim_state dummy step during
+        # distributed-checkpoint save/load, which corrupts the state-dict
+        # mapping (KeyError) or faults on DTensors (illegal memory access).
+        if self.module is not None:
+            for param in self.module.parameters():
+                if param.grad is not None:
+                    param.grad = None
         self.bound_run_id = None
 
     def _require_run(self, run_id: str) -> None:
@@ -788,6 +838,7 @@ class FullParamFSDPWorker:
         micro_batch_size: int,
         forward_only: bool = False,
         replicated: bool = False,
+        num_pieces: int | None = None,
     ) -> Dict[str, Any]:
         self._require_run(run_id)
         if self.optimizer is None:
@@ -801,6 +852,7 @@ class FullParamFSDPWorker:
             micro_batch_size,
             forward_only=forward_only,
             replicated=replicated,
+            num_pieces=num_pieces,
         )
 
     def optim_step(
@@ -952,6 +1004,13 @@ class FullParamFSDPWorker:
             set_state_dict,
         )
 
+        # A load starts a fresh accumulation cycle: clear any stale gradients
+        # first, so torch's _init_optim_state dummy step (which runs during
+        # get_state_dict on fresh optimizers) cannot fold them into the state.
+        for param in self.module.parameters():
+            if param.grad is not None:
+                param.grad = None
+
         opt = self._ensure_optimizer()
 
         model_state, optim_state = get_state_dict(
@@ -1035,6 +1094,13 @@ class FSDPWorkerActor:
         self._worker: Optional[MultiAdapterFSDPWorker | FullParamFSDPWorker] = None
         self._dist_initialized = False
         self.logger = logging.getLogger(f"{__name__}.FSDPWorkerActor")
+        # Ray worker processes default to WARNING, which silently drops the tuft
+        # INFO instrumentation (fsdp_engine [fsdp-timing] etc.). Ensure a root
+        # handler exists and lift the tuft logger tree to INFO; worker stderr is
+        # captured into the server log, the same stream NCCL prints to.
+        if not logging.getLogger().handlers:
+            logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s")
+        logging.getLogger("tuft").setLevel(logging.INFO)
 
     def get_node_ip(self) -> str:
         import ray
@@ -1126,6 +1192,7 @@ class FSDPWorkerActor:
         forward_only: bool = False,
         micro_batch_size: Optional[int] = None,
         replicated: bool = False,
+        num_pieces: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Run forward (+backward) on this actor's data shard.
 
@@ -1138,6 +1205,10 @@ class FSDPWorkerActor:
 
         replicated: every rank received the identical full batch (small-batch
         fallback); skips the world_size loss compensation in the engine.
+
+        num_pieces: shared per-rank piece count; the engine splits this rank's
+        shard into that many token-balanced pieces (preferred over datum-count
+        micro-batches when set).
 
         Caller is responsible for invoking `optim_step` afterwards
         (which will step + zero_grad).
@@ -1156,7 +1227,10 @@ class FSDPWorkerActor:
         # all ranks. Honour it as given: falling back to the whole shard here is
         # what puts a large batch into one micro-batch and OOMs the GPU.
         mb = micro_batch_size if micro_batch_size and micro_batch_size > 0 else len(data)
-        n_micro = (len(data) + mb - 1) // mb
+        if num_pieces and num_pieces > 1:
+            n_micro = min(num_pieces, len(data))
+        else:
+            n_micro = (len(data) + mb - 1) // mb
         out = self._worker.forward_backward(
             adapter_name,
             data,
@@ -1165,6 +1239,7 @@ class FSDPWorkerActor:
             mb,
             forward_only=forward_only,
             replicated=replicated,
+            num_pieces=num_pieces,
         )
         metrics = dict(out.get("metrics") or {})
         metrics["actor/num_micro_batches"] = float(n_micro)
@@ -1537,6 +1612,7 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         loss_fn_config: dict[str, float] | None,
         backward: bool = False,
     ) -> types.ForwardBackwardOutput:
+        t_forward = time.perf_counter()
         adapter_name = self._get_adapter_name(lora_id)
         loss_fn_name = (
             loss_fn if isinstance(loss_fn, str) else getattr(loss_fn, "__name__", "cross_entropy")
@@ -1559,6 +1635,8 @@ class FSDPTrainingBackend(BaseTrainingBackend):
         # eliminating mini-batch SGD intra-step off-policy drift in PPO/GRPO.
         mb = int(getattr(self.config, "micro_batch_size", 0) or 0)
         mb = self._apply_token_budget(mb, data)
+        ray_s = 0.0
+        eff_mb: int | None = None
 
         if self._worker is not None:
             # NO_RAY single-process mode: serialize GPU work across runs. Ray mode is
@@ -1604,13 +1682,35 @@ class FSDPTrainingBackend(BaseTrainingBackend):
             # compensation in replicated mode).
             replicated = len(data) < n_actors
 
-            shards = _shard_list(data, n_actors) if not replicated else [data] * n_actors
+            if replicated:
+                shards = [data] * n_actors
+            else:
+                # Token-balanced contiguous shards instead of equal-count ones:
+                # length-sorted batches make equal-count contiguity extremely
+                # skewed, and the thin ranks then idle inside FSDP-2 collectives.
+                shards = _token_balanced_shards(data, n_actors)
 
             # In multi-actor mode every actor must issue the same number of
             # micro-batches, otherwise FSDP-2 NCCL collectives deadlock
             # (one rank finishes early while others are still iterating).
-            # _uniform_micro_batch_size picks the largest size that satisfies
-            # that while still bounding per-micro-batch memory.
+            # Preferred path: one shared piece count; each rank splits its shard
+            # into that many equal-count pieces, with the per-shard piece size
+            # bounded by micro_batch_tokens (a piece pads at most to its own
+            # longest datum). If the required count cannot fit every shard's
+            # datum count (pathologically heterogeneous lengths), fall back to
+            # the datum-count planner, which is correct on any shape.
+            budget = int(getattr(self.config, "micro_batch_tokens", 0) or 0)
+            if replicated or n_actors == 1 or budget <= 0:
+                num_pieces = None
+            else:
+                need = 1
+                for s in shards:
+                    max_len = max(d.model_input.length for d in s)
+                    cap = max(1, budget // max_len)
+                    need = max(need, -(-len(s) // cap))
+                min_count = min(len(s) for s in shards if s)
+                num_pieces = need if need <= min_count else None
+
             if not replicated:
                 if n_actors == 1:
                     # Single rank: there is no collective to deadlock, so honour
@@ -1619,6 +1719,8 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                     # back to the whole batch as one micro-batch, which is what
                     # OOMs the GPU on batches whose size is not a multiple of mb.
                     eff_mb = mb if mb > 0 else None
+                elif num_pieces and num_pieces > 1:
+                    eff_mb = None
                 else:
                     eff_mb = _uniform_micro_batch_size([len(s) for s in shards], mb)
             else:
@@ -1626,13 +1728,19 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                 # but tiny batches are cheap — one micro-batch keeps it simple.
                 eff_mb = None
 
+            shard_tok = (
+                [sum(d.model_input.length for d in s) for s in shards] if not replicated else []
+            )
             self.logger.info(
-                "FSDP multi-actor forward: batch=%d actors=%d mb=%s eff_mb=%s replicated=%s",
+                "FSDP multi-actor forward: batch=%d actors=%d mb=%s eff_mb=%s replicated=%s "
+                "num_pieces=%s shard_tok=%s",
                 len(data),
                 n_actors,
                 mb,
                 eff_mb,
                 replicated,
+                num_pieces,
+                shard_tok,
             )
 
             refs = []
@@ -1649,11 +1757,14 @@ class FSDPTrainingBackend(BaseTrainingBackend):
                         not backward,
                         eff_mb,
                         replicated,
+                        num_pieces,
                     )
                 )
                 ref_weights.append(len(shard))
 
+            t_ray = time.perf_counter()
             results = await asyncio.to_thread(ray.get, refs) if refs else []
+            ray_s = time.perf_counter() - t_ray
 
             if replicated:
                 # Every actor returned identical outputs; keep one copy so
@@ -1669,6 +1780,35 @@ class FSDPTrainingBackend(BaseTrainingBackend):
 
         # Tinker expects every metric key to be "name:reduction" (e.g. loss:sum)
         metrics = {k: v for k, v in metrics.items() if ":" in k}
+
+        # Engine timings ride the result path because worker stdout forwarding is
+        # unreliable. Log them server-side and keep them out of the client metrics.
+        timing = {k[len("timing/") :]: v for k, v in metrics.items() if k.startswith("timing/")}
+        if timing:
+            metrics = {k: v for k, v in metrics.items() if not k.startswith("timing/")}
+
+        self.logger.info(
+            "[fsdp-call] backward=%s batch=%d eff_mb=%s ray=%.3fs total=%.3fs",
+            backward,
+            len(data),
+            eff_mb,
+            ray_s,
+            time.perf_counter() - t_forward,
+        )
+        if timing:
+            self.logger.info(
+                "[fsdp-engine] fwd_mean=%.3fs bwd_mean=%.3fs prep_mean=%.3fs loss_mean=%.3fs "
+                "total_mean=%.3fs pad_ratio=%.3f real_tok=%.0f padded_tok=%.0f micros=%.0f",
+                timing.get("fwd:mean", 0.0),
+                timing.get("bwd:mean", 0.0),
+                timing.get("prep:mean", 0.0),
+                timing.get("loss:mean", 0.0),
+                timing.get("total:mean", 0.0),
+                timing.get("pad_ratio:mean", 0.0),
+                timing.get("real_tokens:sum", 0.0),
+                timing.get("padded_tokens:sum", 0.0),
+                timing.get("micro_batches:sum", 0.0),
+            )
 
         return types.ForwardBackwardOutput(
             loss_fn_output_type=loss_fn_name,
