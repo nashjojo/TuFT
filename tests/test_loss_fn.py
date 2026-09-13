@@ -225,6 +225,125 @@ def test_dro_loss():
 
 
 @pytest.mark.gpu
+def test_trinity_ppo_loss_matches_reference_formula():
+    """Server-side trinity_ppo must reproduce the client custom loss exactly.
+
+    The reference is transcribed independently from the Trinity trainer spec
+    (verl-style 3-branch PPO with dual clipping + optional K2 KL): per-datum
+    masked token mean, summed across datums, then divided by the full-batch
+    num_total_datums injected per chunk. Loss and d/d(target_logprobs) must
+    match to fp32 tolerance so the client can drop its separate
+    logprob-forward pass with no gradient drift.
+    """
+    import torch
+
+    from tuft.loss_fn import get_loss_fn
+
+    torch.manual_seed(0)
+    b, length = 3, 9
+    target_logprobs = torch.randn(b, length, dtype=torch.float32)
+    old_logprobs = torch.randn(b, length, dtype=torch.float32)
+    ref_logprobs = torch.randn(b, length, dtype=torch.float32)
+    advantages = torch.randn(b, length, dtype=torch.float32)
+    # Unequal valid-token counts (7/5/9) so the per-datum token-mean is
+    # distinguishable from a global token-mean by a length weighting.
+    mask = torch.ones(b, length, dtype=torch.float32)
+    mask[0, 7:] = 0.0
+    mask[1, 5:] = 0.0
+    num_total_datums = 12.0
+
+    def token_terms(target):
+        ratio = torch.exp(torch.clamp(target - old_logprobs, -20.0, 20.0))
+        p1 = -advantages * ratio
+        p2 = -advantages * torch.clamp(ratio, 0.8, 1.2)
+        c1 = torch.maximum(p1, p2)
+        c2 = torch.minimum(-advantages * 3.0, c1)
+        per_token = torch.where(advantages < 0, c2, c1)
+        return per_token + 0.5 * 0.001 * (target - ref_logprobs) ** 2
+
+    def reference(target):
+        per_datum = (token_terms(target) * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+        return per_datum.sum() / num_total_datums
+
+    def reference_global_token_mean(target):
+        per_token = token_terms(target)
+        return (per_token * mask).sum() / mask.sum()
+
+    loss_fn = get_loss_fn("trinity_ppo")
+
+    ours_target = target_logprobs.clone().requires_grad_(True)
+    ours_loss, metrics = loss_fn(
+        {
+            "target_logprobs": ours_target,
+            "logprobs": old_logprobs,
+            "advantages": advantages,
+            "ref_logprobs": ref_logprobs,
+            "mask": mask,
+        },
+        {"num_total_datums": num_total_datums},
+    )
+    ours_loss.backward()
+
+    ref_target = target_logprobs.clone().requires_grad_(True)
+    ref_loss = reference(ref_target)
+    ref_loss.backward()
+
+    assert torch.allclose(ours_loss, ref_loss, atol=1e-6, rtol=1e-6)
+    ours_grad, ref_grad = ours_target.grad, ref_target.grad
+    assert ours_grad is not None and ref_grad is not None
+    assert torch.allclose(ours_grad, ref_grad, atol=1e-5, rtol=1e-4)
+    assert metrics["trinity/ratio_mean:mean"] > 0
+    assert "trinity/clip_frac:mean" in metrics
+    assert "trinity/kl_mean:mean" in metrics
+
+    # This case must discriminate: the legacy global token-mean would give a
+    # different value on unequal lengths (guards against that regression).
+    global_mean_loss = reference_global_token_mean(target_logprobs)
+    assert not torch.isclose(ours_loss, global_mean_loss, atol=1e-6), (
+        "test case lost its length-weighting discrimination"
+    )
+
+    # Without num_total_datums the call falls back to the per-datum mean.
+    fallback_loss, _ = loss_fn(
+        {
+            "target_logprobs": target_logprobs,
+            "logprobs": old_logprobs,
+            "advantages": advantages,
+            "ref_logprobs": ref_logprobs,
+            "mask": mask,
+        },
+        {},
+    )
+    per_datum = (token_terms(target_logprobs) * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+    assert torch.allclose(fallback_loss, per_datum.mean(), atol=1e-6)
+
+    # Padding must be excluded: changing values in masked positions must not
+    # change the loss.
+    padded_a, _ = loss_fn(
+        {
+            "target_logprobs": target_logprobs,
+            "logprobs": old_logprobs,
+            "advantages": advantages,
+            "mask": mask,
+        },
+        {},
+    )
+    shifted = target_logprobs.clone()
+    shifted[0, 7:] = 123.0
+    shifted[1, 5:] = 123.0
+    padded_b, _ = loss_fn(
+        {
+            "target_logprobs": shifted,
+            "logprobs": old_logprobs,
+            "advantages": advantages,
+            "mask": mask,
+        },
+        {},
+    )
+    assert torch.allclose(padded_a, padded_b, atol=1e-6), "padding must not enter the loss"
+
+
+@pytest.mark.gpu
 def test_loss_fn_metrics_reduction():
     import torch
 

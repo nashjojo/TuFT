@@ -23,7 +23,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from tuft.loss_fn import get_loss_fn
 
 
-_RLHF_LOSS_FNS = {"ppo", "grpo", "cispo", "importance_sampling", "dro"}
+_RLHF_LOSS_FNS = {"ppo", "grpo", "cispo", "importance_sampling", "dro", "trinity_ppo"}
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +234,13 @@ def _prepare_loss_fn_inputs(
         # and no weight updates (reward never grows in RL training).
         sampling_logprobs = target_logprobs.detach().clone()
         advantages = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+        has_ref = any("ref_logprobs" in (datum.loss_fn_inputs or {}) for datum in data)
+        ref_logprobs = (
+            torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
+            if has_ref
+            else None
+        )
+        lengths: list[int] = []
         for row, datum in enumerate(data):
             old_logprobs = _datum_field(
                 datum,
@@ -251,11 +258,31 @@ def _prepare_loss_fn_inputs(
             )
             if advantage is not None:
                 _copy_row(advantages, row, advantage)
-        return {
+            if ref_logprobs is not None:
+                ref = _datum_field(
+                    datum,
+                    "ref_logprobs",
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if ref is not None:
+                    _copy_row(ref_logprobs, row, ref)
+            lengths.append(int(datum.model_input.length))
+
+        # Token-validity mask so masked-mean losses (trinity_ppo) can exclude
+        # padding; other RLHF losses simply ignore the extra key.
+        positions = torch.arange(max_len, device=device).unsqueeze(0)
+        mask = (positions < torch.tensor(lengths, device=device).unsqueeze(1)).float()
+
+        inputs: dict[str, torch.Tensor] = {
             "target_logprobs": target_logprobs,
             "logprobs": sampling_logprobs,
             "advantages": advantages,
+            "mask": mask,
         }
+        if ref_logprobs is not None:
+            inputs["ref_logprobs"] = ref_logprobs
+        return inputs
 
     weights = torch.zeros((batch_size, max_len), dtype=torch.float32, device=device)
     for row, datum in enumerate(data):
