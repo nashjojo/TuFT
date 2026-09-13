@@ -18,11 +18,38 @@ from tinker import types
 
 
 try:
+    from tinker.types._pydantic_types.forward_backward_input import ForwardBackwardInput
     from tinker.types._pydantic_types.forward_backward_request import ForwardBackwardRequest
     from tinker.types._pydantic_types.forward_request import ForwardRequest
 
 except ModuleNotFoundError:
     from tinker.types import ForwardBackwardRequest, ForwardRequest
+
+    ForwardBackwardInput = None
+
+
+if ForwardBackwardInput is not None:
+
+    class _TolerantForwardBackwardInput(ForwardBackwardInput):  # type: ignore[misc]
+        """Tinker's input model with loss_fn loosened from the closed Literal to str.
+
+        The tinker mirror validates loss_fn against a fixed name list, which
+        rejects server-registered losses (e.g. trinity_ppo) at the API boundary
+        with a 422 before the server ever sees them. Unknown names are still
+        rejected downstream by get_loss_fn's registry lookup.
+        """
+
+        loss_fn: str  # type: ignore[assignment]
+
+    class _TolerantForwardBackwardRequest(ForwardBackwardRequest):  # type: ignore[misc]
+        forward_backward_input: _TolerantForwardBackwardInput  # type: ignore[assignment]
+
+    class _TolerantForwardRequest(ForwardRequest):  # type: ignore[misc]
+        forward_input: _TolerantForwardBackwardInput  # type: ignore[assignment]
+
+else:
+    _TolerantForwardBackwardRequest = ForwardBackwardRequest  # type: ignore[assignment,misc]
+    _TolerantForwardRequest = ForwardRequest  # type: ignore[assignment,misc]
 
 from .auth import User
 from .compat import maybe_serialize_payload, serialize_sample_response_proto
@@ -339,7 +366,7 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def forward(
-        request: ForwardRequest,
+        request: _TolerantForwardRequest,
         state: ServerState = Depends(_get_state),
         user: User = Depends(_get_user),
     ) -> types.UntypedAPIFuture:
@@ -351,7 +378,8 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
                 request.model_id,
                 user.user_id,
                 data,
-                inp.loss_fn,
+                # str at this boundary (server-registered losses); registry validates
+                cast(types.LossFnType, inp.loss_fn),
                 inp.loss_fn_config,
                 request.seq_id,
                 backward=False,
@@ -380,7 +408,7 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def forward_backward(
-        request: ForwardBackwardRequest,
+        request: _TolerantForwardBackwardRequest,
         state: ServerState = Depends(_get_state),
         user: User = Depends(_get_user),
     ) -> types.UntypedAPIFuture:
@@ -392,7 +420,8 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
                 request.model_id,
                 user.user_id,
                 data,
-                inp.loss_fn,
+                # str at this boundary (server-registered losses); registry validates
+                cast(types.LossFnType, inp.loss_fn),
                 inp.loss_fn_config,
                 request.seq_id,
                 backward=True,

@@ -187,3 +187,35 @@ def test_training_and_sampling_round_trip(server_endpoint: str) -> None:
         assert any(ckpt.public for ckpt in all_checkpoints.checkpoints)
     finally:
         service_client.holder.close()
+
+
+def test_forward_backward_request_accepts_server_registered_loss_names() -> None:
+    """The API boundary must accept server-registered loss names.
+
+    tinker's pydantic mirror types loss_fn as a closed Literal, which would
+    reject e.g. "trinity_ppo" with a 422 before the server could dispatch it;
+    the tolerant request models loosen only that field to str.
+    """
+    from tuft.server import _TolerantForwardBackwardRequest, _TolerantForwardRequest
+
+    req = _TolerantForwardBackwardRequest.model_validate(
+        {
+            "forward_backward_input": {
+                "data": [],
+                "loss_fn": "trinity_ppo",
+                "loss_fn_config": {"num_total_datums": 7680.0},
+            },
+            "model_id": "run:train:0",
+            "seq_id": 3,
+        }
+    )
+    assert req.forward_backward_input.loss_fn == "trinity_ppo"
+    assert req.forward_backward_input.loss_fn_config == {"num_total_datums": 7680.0}
+
+    fwd = _TolerantForwardRequest.model_validate(
+        {
+            "forward_input": {"data": [], "loss_fn": "trinity_ppo"},
+            "model_id": "run:train:0",
+        }
+    )
+    assert fwd.forward_input.loss_fn == "trinity_ppo"
