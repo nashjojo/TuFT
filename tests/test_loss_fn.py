@@ -344,6 +344,42 @@ def test_trinity_ppo_loss_matches_reference_formula():
 
 
 @pytest.mark.gpu
+def test_trinity_ppo_all_zero_mask_metrics_are_finite():
+    """An all-zero mask (a chunk with no response tokens) must not yield NaN/None.
+
+    torch's mean of an empty slice is NaN, which serialized to JSON null and
+    crashed a strict client's validation mid-training (2026-09-14, step 239).
+    """
+    import math
+
+    import torch
+
+    from tuft.loss_fn import get_loss_fn
+
+    torch.manual_seed(0)
+    b, length = 2, 7
+    inputs = {
+        "target_logprobs": torch.randn(b, length),
+        "logprobs": torch.randn(b, length),
+        "advantages": torch.zeros(b, length),
+        "ref_logprobs": torch.randn(b, length),
+        "mask": torch.zeros(b, length),
+    }
+    loss, metrics = get_loss_fn("trinity_ppo")(inputs, {"num_total_datums": 48.0})
+    assert float(loss) == 0.0
+    for key in (
+        "loss:sum",
+        "trinity/ratio_mean:mean",
+        "trinity/ratio_std:mean",
+        "trinity/clip_frac:mean",
+        "trinity/kl_mean:mean",
+    ):
+        assert key in metrics, key
+        assert metrics[key] is not None, key
+        assert math.isfinite(metrics[key]), (key, metrics[key])
+
+
+@pytest.mark.gpu
 def test_loss_fn_metrics_reduction():
     import torch
 

@@ -5,6 +5,18 @@ import torch
 from . import _check_loss_fn_inputs
 
 
+def _mean_or_zero(values: torch.Tensor) -> float:
+    """Mean as a plain float, 0.0 when empty.
+
+    An all-zero mask (a chunk with no response tokens) leaves an empty slice;
+    torch's mean of an empty tensor is NaN, which serializes to JSON null and
+    gets rejected by strict clients. 0.0 keeps every metric a finite float.
+    """
+    if values.numel() == 0:
+        return 0.0
+    return float(values.float().mean().item())
+
+
 def trinity_ppo_loss(
     loss_fn_inputs: Dict[str, torch.Tensor], loss_fn_config: Dict[str, float]
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -70,21 +82,18 @@ def trinity_ppo_loss(
             flat_ratio = ratio[mask > 0]
         metrics: Dict[str, float] = {
             "loss:sum": float(loss.item()),
-            "trinity/ratio_mean:mean": float(flat_ratio.mean().item()),
+            "trinity/ratio_mean:mean": _mean_or_zero(flat_ratio),
             "trinity/ratio_std:mean": float(flat_ratio.std().item())
             if flat_ratio.numel() > 1
             else 0.0,
-            "trinity/clip_frac:mean": float(
-                ((flat_ratio < 1.0 - clip_range) | (flat_ratio > 1.0 + clip_range))
-                .float()
-                .mean()
-                .item()
+            "trinity/clip_frac:mean": _mean_or_zero(
+                (flat_ratio < 1.0 - clip_range) | (flat_ratio > 1.0 + clip_range)
             ),
         }
         if ref_logprobs is not None:
             kl = 0.5 * (target_logprobs - ref_logprobs) ** 2
             if mask is not None:
                 kl = kl[mask > 0]
-            metrics["trinity/kl_mean:mean"] = float(kl.mean().item())
+            metrics["trinity/kl_mean:mean"] = _mean_or_zero(kl)
 
     return loss, metrics
