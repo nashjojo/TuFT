@@ -553,6 +553,11 @@ class TrainingController:
             return await self._with_sequence_guard(record, seq_id, _operation)
 
     async def unload_model(self, model_id: str, user_id: str) -> None:
+        # NOTE: unload removes the run record and its checkpoint registry
+        # entries, so any `tinker://<run>/...` path under this run ID stops
+        # resolving afterwards. Resuming after an unload (e.g. to force an
+        # actor rebuild for a code refresh) therefore requires a checkpoint
+        # that stays registered under a different, still-live run.
         # TODO: Ensure that all created training runs can be unloaded to reduce
         # GPU memory usage.
         if model_id not in self.training_runs:
