@@ -275,11 +275,17 @@ def _prepare_loss_fn_inputs(
         # trained response positions) takes precedence over the length-based
         # fallback: its row sum is the per-datum token-mean divisor of the
         # client's reference loss, which is smaller than the datum length
-        # whenever a prompt region is excluded.
+        # whenever a prompt region is excluded. When no mask is sent, positive
+        # per-token "weights" (the Trinity convention: 0.0 at prompt, 1.0 at
+        # response) stand in for it.
         positions = torch.arange(max_len, device=device).unsqueeze(0)
         mask = (positions < torch.tensor(lengths, device=device).unsqueeze(1)).float()
         for row, datum in enumerate(data):
             client_mask = _datum_field(datum, "mask", device=device, dtype=torch.float32)
+            if client_mask is None:
+                weights = _datum_field(datum, "weights", device=device, dtype=torch.float32)
+                if weights is not None:
+                    client_mask = (weights > 0).float()
             if client_mask is not None:
                 mask[row].zero_()
                 _copy_row(mask, row, client_mask)

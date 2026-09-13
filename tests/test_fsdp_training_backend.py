@@ -422,6 +422,41 @@ def test_fsdp_engine_rl_client_mask_overrides_length_mask():
     )
 
 
+def test_fsdp_engine_rl_weights_fallback_as_mask():
+    """Without a client mask, positive per-token weights stand in for it.
+
+    Trinity's convention marks trained response positions with weights=1.0
+    (0.0 at prompt/truncated), which is exactly the response-mask semantics;
+    clients can then drop the redundant mask array from the payload.
+    """
+    import torch
+
+    from tuft.backends.fsdp_engine import _prepare_loss_fn_inputs
+
+    data = [
+        types.Datum(
+            model_input=types.ModelInput.from_ints(tokens=[1, 2, 3, 4, 5]),
+            loss_fn_inputs={
+                "logprobs": types.TensorData.from_torch(
+                    torch.tensor([0.0, 0.0, -0.5, -0.8], dtype=torch.float32)
+                ),
+                "advantages": types.TensorData.from_torch(
+                    torch.tensor([0.0, 0.0, 1.0, -1.0], dtype=torch.float32)
+                ),
+                "weights": types.TensorData.from_torch(
+                    torch.tensor([0.0, 0.0, 1.0, 1.0], dtype=torch.float32)
+                ),
+            },
+        ),
+    ]
+    inputs = _prepare_loss_fn_inputs(data, torch.randn(1, 5), "trinity_ppo")
+    torch.testing.assert_close(
+        inputs["mask"][0],
+        torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0]),
+        msg="weights>0 must stand in for the response mask",
+    )
+
+
 @pytest.mark.asyncio
 async def test_fsdp_engine_matches_hf_target_tokens_on_cpu():
     from types import SimpleNamespace
