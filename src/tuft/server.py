@@ -10,7 +10,7 @@ from typing import Any, Callable, cast
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel
@@ -64,6 +64,16 @@ from .telemetry import shutdown_telemetry
 logger = logging.getLogger(__name__)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def _tuft_exception_handler(_: Request, exc: TuFTException) -> JSONResponse:
+    """Map a TuFTException's own status_code onto the HTTP response.
+
+    Without this, an unhandled TuFTException (e.g. CheckpointNotFoundException
+    with status_code=404) reaches FastAPI's default handler as a bare 500, and
+    clients that retry 5xx spin on what is actually a terminal error.
+    """
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 async def _get_user(
@@ -155,6 +165,7 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.server_state = ServerState(resolved_config)
+    app.add_exception_handler(TuFTException, _tuft_exception_handler)  # type: ignore[arg-type]
 
     # Mount OpenAI-compatible API router
     oai_router = create_oai_router()

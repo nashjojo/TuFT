@@ -219,3 +219,25 @@ def test_forward_backward_request_accepts_server_registered_loss_names() -> None
         }
     )
     assert fwd.forward_input.loss_fn == "trinity_ppo"
+
+
+def test_tuft_exception_handler_maps_status_code() -> None:
+    """TuFTException must surface its own status, not FastAPI's default 500.
+
+    Checkpoint deletion of an unknown id used to reach clients as a retryable
+    500 (unhandled CheckpointNotFoundException with status_code=404), spinning
+    a resume loop; the handler maps it to a terminal 404.
+    """
+    import asyncio
+    import json
+    from typing import cast
+
+    from fastapi import Request
+
+    from tuft.exceptions import CheckpointNotFoundException
+    from tuft.server import _tuft_exception_handler
+
+    exc = CheckpointNotFoundException("ckpt-x")
+    resp = asyncio.run(_tuft_exception_handler(cast(Request, None), exc))
+    assert resp.status_code == 404
+    assert json.loads(bytes(resp.body))["detail"] == "Checkpoint ckpt-x not found."
