@@ -270,9 +270,19 @@ def _prepare_loss_fn_inputs(
             lengths.append(int(datum.model_input.length))
 
         # Token-validity mask so masked-mean losses (trinity_ppo) can exclude
-        # padding; other RLHF losses simply ignore the extra key.
+        # padding; other RLHF losses simply ignore the extra key. A client-sent
+        # "mask" (same tail alignment as the other per-token arrays; 1.0 at
+        # trained response positions) takes precedence over the length-based
+        # fallback: its row sum is the per-datum token-mean divisor of the
+        # client's reference loss, which is smaller than the datum length
+        # whenever a prompt region is excluded.
         positions = torch.arange(max_len, device=device).unsqueeze(0)
         mask = (positions < torch.tensor(lengths, device=device).unsqueeze(1)).float()
+        for row, datum in enumerate(data):
+            client_mask = _datum_field(datum, "mask", device=device, dtype=torch.float32)
+            if client_mask is not None:
+                mask[row].zero_()
+                _copy_row(mask, row, client_mask)
 
         inputs: dict[str, torch.Tensor] = {
             "target_logprobs": target_logprobs,

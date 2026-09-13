@@ -19,7 +19,8 @@ def trinity_ppo_loss(
         loss_fn_inputs: "target_logprobs" (current weights, server-computed),
             "logprobs" (sampling-time logprobs), "advantages", plus optional
             "ref_logprobs" (base-model logprobs for the KL term) and "mask"
-            (1.0 at valid token positions, 0.0 at padding).
+            (1.0 at trained response-token positions, 0.0 at prompt/padding;
+            the engine forwards the client's per-token mask when present).
         loss_fn_config: clip_range (default 0.2, symmetric),
             clip_ratio_c (default 3.0), kl_coef (default 0.001), and
             num_total_datums (full-batch datum count, e.g. 7680).

@@ -361,6 +361,67 @@ def test_fsdp_engine_rl_prepare_loss_inputs_sampling_logprobs_is_constant_on_cpu
     )
 
 
+def test_fsdp_engine_rl_client_mask_overrides_length_mask():
+    """A client-sent mask overrides the length-based mask, per datum.
+
+    The masked token-mean divisor is the client mask's row sum (trained
+    response tokens): with a prompt region excluded it is smaller than the
+    datum length, and trinity_ppo's per-datum normalization depends on it.
+    """
+    import torch
+
+    from tuft.backends.fsdp_engine import _prepare_loss_fn_inputs
+
+    data = [
+        types.Datum(
+            model_input=types.ModelInput.from_ints(tokens=[1, 2, 3, 4, 5]),
+            loss_fn_inputs={
+                "logprobs": types.TensorData.from_torch(
+                    torch.tensor([0.0, 0.0, -0.5, -0.8], dtype=torch.float32)
+                ),
+                "advantages": types.TensorData.from_torch(
+                    torch.tensor([0.0, 0.0, 1.0, -1.0], dtype=torch.float32)
+                ),
+                "mask": types.TensorData.from_torch(
+                    torch.tensor([0.0, 1.0, 1.0, 1.0], dtype=torch.float32)
+                ),
+            },
+        ),
+        types.Datum(
+            model_input=types.ModelInput.from_ints(tokens=[6, 7, 8]),
+            loss_fn_inputs={
+                "logprobs": types.TensorData.from_torch(
+                    torch.tensor([-0.2, -0.4], dtype=torch.float32)
+                ),
+                "advantages": types.TensorData.from_torch(
+                    torch.tensor([1.0, 1.0], dtype=torch.float32)
+                ),
+            },
+        ),
+    ]
+    target_logprobs = torch.randn(2, 5)
+    inputs = _prepare_loss_fn_inputs(data, target_logprobs, "trinity_ppo")
+    mask = inputs["mask"]
+    # Row 0: the n-1-long client mask lands at [0, n-1); index n-1 stays 0 so
+    # the flat-roll label at the sequence end never enters the loss.
+    torch.testing.assert_close(
+        mask[0],
+        torch.tensor([0.0, 1.0, 1.0, 1.0, 0.0]),
+        msg="client mask row mismatch",
+    )
+    # Row 1: no client mask -> length-based fallback marks [0, length).
+    torch.testing.assert_close(
+        mask[1],
+        torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0]),
+        msg="fallback mask row mismatch",
+    )
+    torch.testing.assert_close(
+        mask.sum(dim=1),
+        torch.tensor([3.0, 3.0]),
+        msg="per-datum token-mean divisors must be the mask row sums",
+    )
+
+
 @pytest.mark.asyncio
 async def test_fsdp_engine_matches_hf_target_tokens_on_cpu():
     from types import SimpleNamespace
