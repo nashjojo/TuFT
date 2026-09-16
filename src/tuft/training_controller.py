@@ -878,9 +878,15 @@ class TrainingController:
             return None
 
         if record.training_mode == "full_param":
-            # Opposite ordering from LoRA: the worker refuses load_state until
-            # the run is bound, and only training checkpoints are loadable, so
-            # bind first and resume from the latest training checkpoint.
+            # Startup restore must NOT load state into the shared full-param
+            # worker.  Every restored record would in turn load its latest
+            # training checkpoint into the single-slot pool (the loads succeed
+            # silently), so the last record processed warm-started whichever
+            # run binds next -- observed 2026-09-17 when a fresh run silently
+            # inherited a v3-era state this way.  Resuming is client-driven;
+            # keep the bind attempt so slot bookkeeping stays uniform, but only
+            # report the latest training checkpoint (sampler checkpoints are HF
+            # model dirs, not distributed-checkpoint state).
             try:
                 # Full-param workers ignore the rank; it is only a carrier so the
                 # shared create_adapter signature stays uniform.
@@ -889,26 +895,9 @@ class TrainingController:
                 )
             except Exception:  # pylint: disable=broad-except
                 logger.exception("Failed to bind full-param run %s during restore", model_id)
-            # Only training checkpoints are loadable in full-param mode: sampler
-            # checkpoints are HF model dirs, not distributed-checkpoint state.
             if not record.checkpoints:
                 return None
-            resume_ckpt = max(record.checkpoints.values(), key=lambda c: c.created_at)
-            try:
-                await record.backend.load_state(
-                    lora_id=model_id, checkpoint_record=resume_ckpt, optimizer=True
-                )
-            except Exception:  # pylint: disable=broad-except
-                record.corrupted = True
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._save_training_run, model_id)
-                logger.warning(
-                    "Checkpoint load failed for %s; returning checkpoint "
-                    "with future_id=%d for future cleanup",
-                    model_id,
-                    resume_ckpt.future_id,
-                )
-            return resume_ckpt
+            return max(record.checkpoints.values(), key=lambda c: c.created_at)
 
         latest_ckpt = self.get_latest_checkpoint(model_id)
         if latest_ckpt is None:

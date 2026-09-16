@@ -1167,11 +1167,15 @@ def _make_checkpoint(app_config, run_id, ckpt_id, ckpt_type, created_at):
 
 
 @pytest.mark.asyncio
-async def test_full_param_restore_reports_the_checkpoint_it_loaded(tmp_path):
-    """A newer sampler checkpoint must not be reported as the resume point.
+async def test_full_param_restore_reports_the_checkpoint_without_loading_it(tmp_path):
+    """Startup restore must not load state into the shared full-param worker.
 
-    Only training checkpoints are loadable in full-param mode; sampler
-    checkpoints are HF model dirs, not distributed-checkpoint state.
+    Every restored record would in turn load its latest training checkpoint
+    into the single-slot pool (the loads succeed silently), so the last record
+    processed warm-started whichever run binds next (observed 2026-09-17).
+    The restore still reports the latest training checkpoint so future-cleanup
+    bookkeeping stays intact; sampler checkpoints (HF model dirs, not
+    distributed-checkpoint state) are never reported.
     """
     app_config = _create_test_config(tmp_path / "checkpoints")
     controller = TrainingController(app_config)
@@ -1203,7 +1207,7 @@ async def test_full_param_restore_reports_the_checkpoint_it_loaded(tmp_path):
 
     assert restored is not None
     assert restored.checkpoint_id == "state-9"
-    assert backend.loaded == [(run_id, "state-9", True)]
+    assert backend.loaded == []
     assert backend.created == [run_id]
 
 
