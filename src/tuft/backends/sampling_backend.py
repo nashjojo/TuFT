@@ -712,13 +712,35 @@ class DPSamplingBackend(BaseSamplingBackend):
         return self._active_weights_path
 
     async def revert_to_base_weights(self) -> None:
-        """Revert every DP replica to the base model and clear deployment state."""
+        """Revert every DP replica to the base model and clear deployment state.
+
+        The reload must be driven here: the per-instance ``revert_to_base_weights``
+        guard checks a flag that only the instance's own ``deploy_full_weights``
+        sets, while the DP deploy path calls ``inst.reload_weights`` directly. A
+        revert that delegates to the instances therefore early-returns without
+        reloading and the replicas keep serving the last deployed checkpoint.
+        """
         if self._active_deployment_id is None:
             return
-        await asyncio.gather(*[inst.revert_to_base_weights() for inst in self._instances])
-        self._active_weights_path = None
-        self._active_deployment_id = None
-        logger.info("Reverted %d DP replicas to base weights", self._dp_size)
+        async with self._deploy_lock:
+            base_path = str(self.config.model_path)
+            await asyncio.gather(*[inst.close_gate_and_drain() for inst in self._instances])
+            try:
+                logger.info("Reloading %d vLLM replicas from %s", self._dp_size, base_path)
+                await asyncio.gather(*[inst.reload_weights(base_path) for inst in self._instances])
+                health = await asyncio.gather(*[inst.get_health() for inst in self._instances])
+                if not all(health):
+                    raise RuntimeError(
+                        "One or more vLLM replicas became unhealthy during base revert"
+                    )
+            finally:
+                for inst in self._instances:
+                    async with inst._gate_condition:
+                        inst._gate_open = True
+                        inst._gate_condition.notify_all()
+            self._active_weights_path = None
+            self._active_deployment_id = None
+            logger.info("Reverted %d DP replicas to base weights", self._dp_size)
 
     def is_ready(self) -> bool:
         return all(inst.is_ready() for inst in self._instances)
