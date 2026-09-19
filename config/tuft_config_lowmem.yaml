@@ -1,0 +1,215 @@
+# TuFT Configuration Example
+#
+# This file contains all available configuration options for the TuFT server.
+# Copy this file to your desired location and modify as needed.
+#
+# Usage:
+#   tuft launch --config /path/to/your/tuft_config.yaml
+
+# =============================================================================
+# Checkpoint Directory
+# =============================================================================
+# Directory for storing model checkpoints and LoRA weights.
+# Default: ~/.cache/tuft/checkpoints
+checkpoint_dir: /mnt/workspace/kaixiang/ckpts/
+
+worker_venv_path: /mnt/workspace/kaixiang/TuFT/.qoder/worktrees/tuft_server_v3/.venv/
+# =============================================================================
+# Model Owner
+# =============================================================================
+# Default owner for models created on this server.
+model_owner: local-user
+
+# =============================================================================
+# Supported Models
+# =============================================================================
+# List of base models available for training and sampling.
+# Each model requires:
+#   - model_name: Unique identifier used in API calls
+#   - model_path: Path to model checkpoint (local path or HuggingFace model ID)
+#   - max_model_len: Maximum context length supported by the model
+#
+# Optional model settings:
+#   - tensor_parallel_size: Number of GPUs for tensor parallelism (default: 1)
+#   - temperature: Default sampling temperature (default: 1.0)
+#   - top_p: Default nucleus sampling probability (default: 1.0)
+#   - top_k: Default top-k sampling (default: -1, disabled)
+#   - logprobs: Number of log probabilities to return (default: 0)
+#   - seed: Random seed for reproducibility (default: 42)
+#   - min_response_tokens: Minimum tokens to generate (default: 0)
+#   - default_max_tokens: Default max_tokens when client does not specify one (default: None = vLLM default ~16)
+#   - max_lora_rank: Maximum LoRA adapter rank (default: 16)
+#   - max_loras: Maximum simultaneous LoRA adapters (default: 1)
+#   - colocate: Colocate sampling and training on same device (default: false)
+#   - sampling_memory_fraction: GPU memory fraction for sampling (default: 0.2)
+#   - enable_auto_tool_choice: vLLM OpenAI API auto tool choice (qwenpaw ReAct)
+#   - tool_call_parser: vLLM tool parser (e.g. hermes for Qwen3-Thinking)
+#   - reasoning_parser: vLLM reasoning parser (e.g. qwen3)
+
+supported_models:
+  - model_name: Qwen/Qwen3-1.7B
+    model_path: /mnt/workspace/kaixiang/models/Qwen3-1.7B
+    max_model_len: 32768
+    # vLLM-only context cap. Trinity's yaml targets max_model_len=8192, but
+    # leaving sampling at 32768 makes vLLM size its KV cache and peak prefill
+    # allocations for 4x the real workload, which pushed the DP replicas to
+    # 80.7/81.9 GiB (1.2 GiB headroom). Training keeps the full 32768.
+    # Do not raise this: it is part of the SUPPORTED_MODELS signature validated
+    # against Redis, so changing it refuses startup. vLLM needs one output token
+    # even for a prompt-logprob request, so callers must send at most
+    # max_model_len - 1 tokens.
+    sampling_max_model_len: 8192
+    default_max_tokens: 8192
+    tensor_parallel_size: 1
+    # 8 GPUs, partitioned: 4 vLLM sampling (GPU 0-3) + 4 FSDP training
+    # (GPU 4-7), both pinned explicitly via TUFT_SAMPLING_GPUS and
+    # TUFT_FSDP_GPUS in _start_tuft.sh. vLLM and FSDP must NOT share a
+    # card - vLLM pre-allocates ~90% and FSDP's optimizer allocations
+    # would push a shared card into OOM / illegal-access (root cause of
+    # the seven engine crashes on 2026-09-06).
+    fsdp_num_gpus: 4
+    data_parallel_size: 4
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_lora_rank: 32
+    # max_loras 8: crashes 7-8 showed delayed engine death ~12 min after a
+    # sampler LoRA hot-swap; with max_loras=2 the just-replaced adapter is
+    # LRU-evicted while stale in-flight requests still reference it. 8 slots
+    # (~70MB each at r32x7mod) keep the last several sampler versions resident.
+    max_loras: 8
+    # Full linear-projection set for RL-grade LoRA capacity: 17.4M trainable
+    # params at rank 16 (1.02% of model) vs 3.2M for the old q+v default.
+    # All seven modules are in vLLM's Qwen3 LoRA support set, so sampler
+    # checkpoints serve correctly.
+    lora_target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    training_backend: fsdp
+    # micro_batch_size counts datums per FSDP micro-batch. With sorted-input
+    # RL clients (Trinity), 16 x ~1464 tok = ~23k tok/micro-batch, inside the
+    # 32k-token envelope verified on this 4-rank layout. mb applies only when
+    # it divides every rank shard; otherwise the whole shard becomes one
+    # micro-batch, so clients must cap each forward_backward at ~128k tokens
+    # (4 ranks x 32k) to bound the fallback case.
+    micro_batch_size: 16
+    # Per-micro-batch token budget: clamps eff_mb to budget // max_datum_len
+    # per call, so a long-tail batch (e.g. 8192-token datums) drops from
+    # mb=16 (131k tok, OOM) to mb=4 (32k tok, verified envelope) while
+    # homogeneous batches keep the full mb=16 speedup.
+    micro_batch_tokens: 32768
+    # A/B toggle (speed study with trinity_alfworld_v3-fe): false removes the
+    # backward activation recompute (+25-35% FLOPs) at the cost of activation
+    # memory. Measured 2026-09-13: OFF is ~22-34% faster at 16k-token
+    # micro-batches but OOMs at 32k (and sits at 79.8/81.9 GiB at 16k), so it is
+    # NOT viable for the ALFWorld workload (up to 8k-token datums, eff_mb 3-4).
+    # Keep true (production); revisit only with a much lower micro_batch_tokens.
+    fsdp_gradient_checkpointing: true
+    # Partial checkpointing: keep the LAST N decoder layers uncheckpointed.
+    # REVERTED to 0 on 2026-09-14 ~01:10: N=12 looked promising on synthetic
+    # 12x8192 benches (-9%, 75.8 GiB at 24k-token pieces) but on the real
+    # production workload it showed no speedup (457/495s vs 438/445s baseline)
+    # and OOM'd at step 236 (78.8 GiB, training cards ~80.3-80.8 GB) because
+    # real chunks contain up to 32k-token pieces — the activation margin was
+    # too thin. Do not re-enable without a memory-accounting pass covering the
+    # worst-case piece size.
+    fsdp_checkpoint_skip_layers: 0
+    attn_implementation: flash_attention_2
+    # Qwen3 hybrid-thinking model: may emit <think> blocks. The qwen3
+    # reasoning parser strips them so the hermes tool-call parser can see
+    # the ReAct tool calls (same pairing as v22-verified Thinking-2507).
+    enable_auto_tool_choice: true
+    tool_call_parser: hermes
+    reasoning_parser: qwen3
+    fsdp_rank_slots:
+      8: 16
+      16: 8
+      32: 4
+
+  # - model_name: Qwen/Qwen3-8B
+  #   model_path: /mnt/cpfs/shared/qwen/Qwen3-8B
+  #   max_model_len: 8192
+  #   tensor_parallel_size: 1
+  #   temperature: 1.0
+  #   fsdp_num_gpus: 1
+  #   top_p: 1.0
+  #   top_k: -1
+  #   max_lora_rank: 16
+  #   max_loras: 1
+  #   training_backend: hf
+  #   fsdp_rank_slots:
+  #     8: 16
+  #     16: 8
+
+# =============================================================================
+# Authentication
+# =============================================================================
+# API key to user mapping for authentication.
+# Format: api_key: user_id
+#
+# Note: This is a temporary implementation. Replace with proper auth system
+# for production use.
+
+authorized_users:
+  # Example: my-secret-api-curl -H "X-API-Key: tml-tuft-dev-key" http://localhost:10610/api/v1/healthz: admin-user
+  tml-tuft-dev-key: local-user
+
+# =============================================================================
+# Persistence Configuration
+# =============================================================================
+# Configure state persistence for recovery after server restart.
+# For detailed documentation, see the "Persistence" section in README.md.
+#
+# Available modes:
+#   - DISABLE: No persistence (default)
+#   - REDIS: External Redis server
+#   - FILE: File-backed store
+
+persistence:
+  mode: REDIS  # Options: DISABLE, REDIS, FILE
+
+  # For REDIS mode:
+  # DB 2: switched from DB 1 when base model changed 4B-Thinking -> 1.7B
+  # (SUPPORTED_MODELS signature mismatch on restart; DB 1 state preserved).
+  redis_url: "redis://127.0.0.1:6379/4?socket_timeout=60"
+
+  # For FILE mode:
+  # file_path: "/mnt/workspace/kaixiang/tuft_redis/file_redis.json"
+
+  # Namespace prefix for Redis keys. (optional, defaults to "persistence-tuft-server".)
+  # namespace: "persistence-tuft-server"
+
+  # TTL (Time-To-Live) for future records in seconds.
+  # Futures are short-lived async operation results that expire after this duration.
+  # Set to null for no expiry (not recommended for production).
+  # Default: 86400 (1 day)
+  # future_ttl_seconds: 86400
+
+  # Fields to validate on server restart for config consistency.
+  # For detailed documentation on available fields and config validation,
+  # see the "Configuration Validation" section in README.md.
+  # Defaults to ["SUPPORTED_MODELS"]. SUPPORTED_MODELS is always checked.
+  # check_fields:
+  #   - SUPPORTED_MODELS
+  #   - CHECKPOINT_DIR
+
+# =============================================================================
+# Telemetry Configuration (OpenTelemetry)
+# =============================================================================
+# Configure observability with distributed tracing, metrics, and logging.
+#
+# Environment variables (alternative to config):
+#   - TUFT_OTLP_ENDPOINT: OTLP collector endpoint
+#   - TUFT_OTEL_DEBUG: Enable console exporter for debugging
+
+telemetry:
+  enabled: false
+  service_name: tuft
+  otlp_endpoint: http://8.130.75.18:10614
+  resource_attributes:
+    deployment.environment: demo
